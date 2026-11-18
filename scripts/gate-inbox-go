@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+work=$(mktemp -d "${TMPDIR:-/tmp}/gate-inbox-build.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+
+export GOWORK=off
+go mod download github.com/usestring/gate-inbox
+upstream=$(go list -m -f '{{.Dir}}' github.com/usestring/gate-inbox)
+cp -R "$upstream" "$work/upstream"
+chmod -R u+w "$work/upstream"
+(cd "$work/upstream" && patch -s -F 0 -p1 < "$repo/patches/gate-inbox-session-preview.patch")
+
+export GOWORK="$work/go.work"
+go work init "$repo" "$work/upstream"
+go "$@"

@@ -2,8 +2,8 @@
 
 A [Gate Inbox](https://github.com/usestring/gate-inbox) extension that puts the agents running on
 your other machines on your board, as ordinary rows. They sort into the same triage queue as your
-local sessions, their preview is the other machine's pane, and focusing one types into the agent
-there.
+local sessions. The preview shows the remote conversation and live dialog, and focusing a row
+opens the remote terminal.
 
 Without it, agents on three machines mean three boards in three SSH windows, three queues, and
 notifications only from whichever board you are attached to.
@@ -20,27 +20,26 @@ questions. This extension adds two things to the same build:
   `ssh -t <machine> tmux attach -t =gi_<id>`, and pins the row's status to the one that machine's
   board reports. When the session ends on its machine, the mirror is archived.
 
-Everything after that is the board's own code. Triage hands over a mirror that is waiting, focus
-is the other machine's agent on screen, and answering it there answers that agent.
+When you select a mirror, the board asks that machine for its recent conversation and current
+dialog over SSH. The preview uses the same message boxes and dialog cards as local sessions.
+Enter opens the remote terminal so you can answer there, including when triage hands you the row.
 
-It is built entirely on the public `extension` package: a role with `PinnedStatus`, `Launch`,
-`PinStatus`, `Archive`, badges, a detail line, and a CLI command. Nothing in Gate Inbox is
-changed.
+The extension uses Gate Inbox's public APIs for the rows and their lifecycle. The build applies
+a patch to Gate Inbox v1.1.0 so the extension can supply conversations and dialogs to its renderer.
 
 ## Install
 
-On the machine you sit at, build this in place of the `gate-inbox` you run now:
+From a checkout of this repo, build this in place of the `gate-inbox` you run now:
 
 ```bash
-go install github.com/hung-ng/gate-inbox-machines/cmd/gate-inbox@latest
+./scripts/gate-inbox-go install ./cmd/gate-inbox
 ```
 
-Your config, state and sessions carry over. It is pinned to Gate Inbox v1.1.0, the release a plain
-`go install github.com/usestring/gate-inbox@latest` installs; `go get
-github.com/usestring/gate-inbox@<version>` and a rebuild moves it to another.
+Your config, state and sessions carry over. The build script applies the preview patch to a
+temporary copy of the pinned Go module.
 
-Each other machine needs this build only to answer `machines sessions`. Its board can keep
-running stock Gate Inbox, as long as `gate_inbox` names a copy of this build on that machine.
+Each other machine needs this build to answer `machines sessions` and `machines preview`. Its
+board can keep running stock Gate Inbox. Point `gate_inbox` at the extended binary on that machine.
 
 Each machine needs an SSH key login from the one you sit at that works without a prompt, because
 the extension runs SSH with `BatchMode=yes`. Check it with `ssh <machine> true`.
@@ -236,8 +235,8 @@ sequences, which is left as future work.
   the mirror. The board's log says how many a machine left out. `machines sessions` there marks them
   `not mirrored`. Bringing such a pane into the board (`ctrl+alt+a`) relaunches it as a `gi_`
   session, and it is mirrored from then on.
-- A mirror's preview has no conversation to show, because the transcript lives on the other
-  machine. Focus the row to see that machine's screen.
+- The preview shows recent user-facing messages and the current dialog. Open the terminal
+  for tool output or to answer a prompt.
 - Priority tiers set on the other machine are not carried over. Set a mirror's priority on your
   own board.
 - On a narrow list the badge can be cut off. The detail line always shows the machine.
@@ -245,8 +244,8 @@ sequences, which is left as future work.
 ## Develop
 
 ```bash
-go vet ./...
-go test -race ./...
+./scripts/gate-inbox-go vet ./...
+./scripts/gate-inbox-go test -race ./...
 ```
 
 The tests cover config, quoting (each quoted word is checked against real `sh`, `bash` and

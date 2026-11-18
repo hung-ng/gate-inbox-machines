@@ -8,7 +8,8 @@
 // `ssh -t <machine> tmux attach -t gi_<id>`, with its status pinned to the
 // one that machine's board reports. The board then does the rest with what
 // it already has: the row sorts into triage, its preview is the other
-// machine's pane, and focusing it types into the agent there.
+// machine's conversation and current dialog, and focusing it types into
+// the agent there.
 //
 // Nothing listens on a port. Everything goes over ssh with the operator's
 // own key, so this extension can reach on a machine exactly what the
@@ -57,13 +58,14 @@ skip_rename_directive = true
 
 // Extension is the machines extension. The zero value is not ready; use New.
 type Extension struct {
-	cfg    config
-	conf   extension.Config
-	ui     extension.UIHost
-	run    runner
-	attach attachRunner
-	wake   chan string
-	tools  toolCache
+	cfg      config
+	conf     extension.Config
+	ui       extension.UIHost
+	run      runner
+	attach   attachRunner
+	wake     chan string
+	tools    toolCache
+	previews previewRoutes
 }
 
 // New returns the extension, to list in app.Options.Extensions.
@@ -126,6 +128,7 @@ func (e *Extension) StartBoard(ctx context.Context, board extension.BoardHost) (
 	m := newMirrors(e.cfg, board, e.ui, board.Logger(), e.run, dataDir)
 	m.wake = e.wake
 	m.tools = &e.tools
+	m.previews = &e.previews
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -139,12 +142,13 @@ const (
 	usageSessions = "machines sessions [--tmux <path>] [--tmux-socket <name>] [--json]"
 	usageAttach   = "machines attach <machine> <session-id>"
 	usageCheck    = "machines check [<machine>...]"
+	usagePreview  = "machines preview <session-id>"
 )
 
 func (e *Extension) Commands() []extension.Command {
 	return []extension.Command{{
 		Name:  "machines",
-		Usage: "machines <sessions|attach|check>",
+		Usage: "machines <sessions|attach|check|preview>",
 		About: "show this board's sessions to your other machines' boards, attach to one of theirs, and check the setup",
 		Run:   e.runMachines,
 	}}
@@ -166,6 +170,18 @@ func (e *Extension) runMachines(ctx context.Context, args []string, host extensi
 			Name: "check", Usage: usageCheck,
 			About: "check that each configured machine can be polled and attached to, and say what to fix",
 			Run:   func(args []string) error { return e.runCheck(ctx, args, os.Stdout) },
+		},
+		{
+			Name: "preview", Usage: usagePreview,
+			About: "read a session's conversation and live dialog for a mirror",
+			Run: func(args []string) error {
+				set := cmdline.NewFlagSet(usagePreview)
+				operands, err := cmdline.Parse(os.Stdout, program, set, args, 1, 1)
+				if err != nil {
+					return err
+				}
+				return writePreview(ctx, operands[0], host, os.Stdout)
+			},
 		},
 	}, args)
 }

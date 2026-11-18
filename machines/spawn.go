@@ -42,7 +42,7 @@ func availableTools(ctx context.Context, h extension.Host) ([]string, error) {
 }
 
 func (e *Extension) machineUI() extension.UI {
-	return extension.UI{Keys: []extension.KeyBinding{
+	return extension.UI{Preview: &extension.PreviewSource{Role: roleName, Read: e.readPreview}, Keys: []extension.KeyBinding{
 		{Screen: extension.ScreenList, Action: "new_on_machine", Label: "new session on another machine", Keys: []string{"N"},
 			Run: func(ctx context.Context, _ extension.Press) error {
 				if len(e.cfg.Hosts) == 0 {

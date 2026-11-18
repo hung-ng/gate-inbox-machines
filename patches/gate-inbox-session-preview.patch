@@ -1,0 +1,421 @@
+--- a/app/boardui.go
++++ b/app/boardui.go
+@@ -34,9 +34,16 @@
+ 		}
+ 		keys, filters := uiKeys(ctx, result.ID, result.UI.Keys), uiFilters(result.UI.Filters)
+ 		applyAliases(result.ID, result.UI.Aliases, keys, filters)
+-		uis = append(uis, ui.ExtensionUI{Owner: result.ID, Keys: keys, Filters: filters,
++		contribution := ui.ExtensionUI{Owner: result.ID, Keys: keys, Filters: filters,
+ 			OpenHeader: uiOpenHeader(ctx, result.UI.OpenHeader), HeaderPane: uiHeaderPane(result.UI.HeaderPane),
+-			FoldHeaders: result.UI.FoldHeaders})
++			FoldHeaders: result.UI.FoldHeaders}
++		if preview := result.UI.Preview; preview != nil && preview.Role != "" && preview.Read != nil {
++			contribution.PreviewRole = result.ID + "/" + preview.Role
++			contribution.ReadPreview = func(id string) (extension.SessionPreview, error) {
++				return preview.Read(ctx, id)
++			}
++		}
++		uis = append(uis, contribution)
+ 	}
+ 	model.InstallExtensions(uis, bridge)
+ 	bridge.Attach(send)
+--- /dev/null
++++ b/extension/sessionpreview.go
+@@ -0,0 +1,39 @@
++package extension
++
++import "context"
++
++// PreviewSource supplies the conversation view for sessions with Role,
++// the unqualified name of one of the extension's roles.
++type PreviewSource struct {
++	Role string
++	// Read runs off the event loop while a session is selected. The
++	// returned dialog is read-only.
++	Read func(ctx context.Context, sessionID string) (SessionPreview, error)
++}
++
++// SessionPreview holds user-facing messages and the current dialog, if any.
++type SessionPreview struct {
++	Messages []PreviewMessage `json:"messages,omitempty"`
++	Dialog   *PreviewDialog   `json:"dialog,omitempty"`
++}
++
++type PreviewMessage struct {
++	Role string `json:"role"`
++	Text string `json:"text"`
++}
++
++type PreviewDialog struct {
++	Kind    string          `json:"kind"`
++	Lines   []string        `json:"lines"`
++	Choices []PreviewChoice `json:"choices,omitempty"`
++}
++
++type PreviewChoice struct {
++	Label  string `json:"label"`
++	Cursor bool   `json:"cursor,omitempty"`
++}
++
++// PreviewReader is implemented by the operator's CLI session service.
++type PreviewReader interface {
++	Preview(ctx context.Context, id string) (SessionPreview, error)
++}
+--- a/extension/ui.go
++++ b/extension/ui.go
+@@ -30,6 +30,7 @@
+ 
+ // UI is what an extension adds to the board's screens.
+ type UI struct {
++	Preview *PreviewSource
+ 	Keys    []KeyBinding
+ 	Filters []Filter
+ 	// Aliases carry the operator's stored choices over from the names they
+--- /dev/null
++++ b/internal/extensionhost/preview.go
+@@ -0,0 +1,18 @@
++package extensionhost
++
++import (
++	"context"
++	"errors"
++
++	"github.com/usestring/gate-inbox/extension"
++)
++
++func (s *sessions) Preview(ctx context.Context, id string) (extension.SessionPreview, error) {
++	if err := ctx.Err(); err != nil {
++		return extension.SessionPreview{}, err
++	}
++	if !s.operator {
++		return extension.SessionPreview{}, errors.New("only the operator can read a session preview")
++	}
++	return s.cmds.Preview(id)
++}
+--- a/internal/migrate/migrate.go
++++ b/internal/migrate/migrate.go
+@@ -74,6 +74,17 @@
+ 		return toolName
+ 	}
+ 	return ""
++}
++
++// HistoryFormat adds the command-name fallback used by the history index.
++func HistoryFormat(name string, tool config.Tool) string {
++	if format := Format(name, tool); format != "" {
++		return format
++	}
++	if fields := strings.Fields(tool.Command); len(fields) > 0 {
++		return filepath.Base(fields[0])
++	}
++	return name
+ }
+ 
+ // Locate finds the source session's transcript. The session must have a
+--- /dev/null
++++ b/internal/sessioncmd/preview.go
+@@ -0,0 +1,57 @@
++package sessioncmd
++
++import (
++	"slices"
++
++	"github.com/usestring/gate-inbox/extension"
++	"github.com/usestring/gate-inbox/extension/textfmt"
++	"github.com/usestring/gate-inbox/internal/dialog"
++	"github.com/usestring/gate-inbox/internal/migrate"
++	"github.com/usestring/gate-inbox/internal/opencode"
++	"github.com/usestring/gate-inbox/internal/search"
++)
++
++// Preview reads the inputs to the board's conversation view on the operator's behalf.
++func (s *Sessions) Preview(id string) (extension.SessionPreview, error) {
++	runtime, err := s.open()
++	if err != nil {
++		return extension.SessionPreview{}, err
++	}
++	defer runtime.store.Close()
++	target, err := runtime.agent(id)
++	if err != nil {
++		return extension.SessionPreview{}, err
++	}
++	if err := runtime.reach(target); err != nil {
++		return extension.SessionPreview{}, err
++	}
++	var preview extension.SessionPreview
++	if !target.Archived && runtime.driver.Exists(id) {
++		if pane, err := runtime.driver.CapturePane(id); err == nil {
++			if screen, ok := dialog.ReadScreenFor(target.Tool, pane); ok {
++				preview.Dialog = &extension.PreviewDialog{Kind: string(screen.Kind), Lines: screen.Lines}
++				for _, choice := range screen.Choices {
++					preview.Dialog.Choices = append(preview.Dialog.Choices, extension.PreviewChoice{Label: choice.Label, Cursor: choice.Cursor})
++				}
++			}
++		}
++	}
++	locator := search.NewLocator(s.roots.ClaudeHome, s.roots.CodexRoot)
++	format := migrate.HistoryFormat(target.Tool, runtime.cfg.Tools[target.Tool])
++	if source, ok := locator.Target(id, format, target.Cwd, target.AgentSessionID); ok {
++		messages, err := search.ReadMessages(source, opencode.DBPath())
++		if err == nil {
++			// Cap the bytes sent over SSH and keep the newest messages.
++			const limit = 256 << 10
++			remaining := limit
++			for i := len(messages) - 1; i >= 0 && remaining > 64; i-- {
++				message := messages[i]
++				text := textfmt.Tail(message.Text, remaining-64)
++				preview.Messages = append(preview.Messages, extension.PreviewMessage{Role: message.Role, Text: text})
++				remaining -= len(text) + 64
++			}
++			slices.Reverse(preview.Messages)
++		}
++	}
++	return preview, nil
++}
+--- a/internal/ui/conversation.go
++++ b/internal/ui/conversation.go
+@@ -12,2 +12,3 @@
+ 	"github.com/charmbracelet/x/ansi"
++	"github.com/usestring/gate-inbox/extension"
+ 	"github.com/usestring/gate-inbox/extension/textfmt"
+@@ -24,2 +25,4 @@
+ 	pendingKey   string
++	preview      *extension.SessionPreview
++	previewRead  uint64
+ 	key, stamp   string
+@@ -46,9 +49,11 @@
+ type conversationMsg struct {
+-	key, stamp string
+-	messages   []search.Message
+-	usage      search.TokenUsage
+-	err        error
+-	unchanged  bool
+-	stoppedWhy string
+-	opening    string
++	preview     *extension.SessionPreview
++	previewRead uint64
++	key, stamp  string
++	messages    []search.Message
++	usage       search.TokenUsage
++	err         error
++	unchanged   bool
++	stoppedWhy  string
++	opening     string
+ }
+@@ -98,2 +103,5 @@
+ 	c.busy = true
++	if read := m.previewSource(sess.Role); read != nil {
++		return c.readPreview(sess.ID, key, read)
++	}
+ 	c.pendingKey = key
+@@ -163,3 +171,3 @@
+ 	c := m.conversation
+-	if c == nil {
++	if c == nil || msg.previewRead != 0 && msg.previewRead != c.previewRead {
+ 		return
+@@ -181,3 +189,3 @@
+ 	}
+-	c.opening = msg.opening
++	c.opening, c.preview = msg.opening, msg.preview
+ 	if c.key != msg.key {
+@@ -276,3 +284,3 @@
+ 		rows = c.wrapped(width)
+-	case c.busy && sess.Status != status.Dead:
++	case c.busy && sess.Status != status.Dead && c.preview == nil && m.previewSource(sess.Role) == nil:
+ 		// A read for the newly selected row is in flight. Keep the last
+@@ -345,2 +353,9 @@
+ func (m *Model) withQuestionCard(rows []string, width, height int) []string {
++	if sess, ok := m.selected(); ok && m.previewSource(sess.Role) != nil {
++		c := m.conversation
++		if c.key != m.conversationIdentity(sess) || c.preview == nil || c.err != nil {
++			return rows
++		}
++		return append(rows[:len(rows):len(rows)], m.extensionPreviewCard(c.preview.Dialog, width, height)...)
++	}
+ 	card := m.previewQuestions(width, height)
+--- /dev/null
++++ b/internal/ui/extensionpreview.go
+@@ -0,0 +1,81 @@
++package ui
++
++import (
++	"fmt"
++	"reflect"
++	"strings"
++	"unicode"
++
++	tea "charm.land/bubbletea/v2"
++	"github.com/charmbracelet/x/ansi"
++	"github.com/usestring/gate-inbox/extension"
++	"github.com/usestring/gate-inbox/internal/dialog"
++	"github.com/usestring/gate-inbox/internal/search"
++)
++
++func (m *Model) previewSource(role string) func(string) (extension.SessionPreview, error) {
++	if role != "" {
++		for _, ui := range m.extUIs {
++			if ui.PreviewRole == role {
++				return ui.ReadPreview
++			}
++		}
++	}
++	return nil
++}
++
++func (c *conversationView) readPreview(id, key string, read func(string) (extension.SessionPreview, error)) tea.Cmd {
++	c.pendingKey = key
++	c.previewRead++
++	request := c.previewRead
++	previous := c.preview
++	sameRow := c.key == key && c.err == nil
++	return func() (out tea.Msg) {
++		msg := conversationMsg{key: key, previewRead: request}
++		defer func() {
++			if recover() != nil {
++				msg.err = fmt.Errorf("extension preview failed")
++				out = msg
++			}
++		}()
++		preview, err := read(id)
++		msg.preview, msg.err = &preview, err
++		if err == nil {
++			msg.unchanged = sameRow && reflect.DeepEqual(previous, &preview)
++			if !msg.unchanged {
++				for _, message := range preview.Messages {
++					msg.messages = append(msg.messages, search.Message{Role: message.Role, Text: message.Text})
++				}
++			}
++		}
++		return msg
++	}
++}
++
++func (m *Model) extensionPreviewCard(preview *extension.PreviewDialog, width, height int) []string {
++	if preview == nil {
++		return nil
++	}
++	c := &m.screenCard
++	if c.extension == preview && c.width == width && c.height == height && c.theme == renderGen {
++		return c.lines
++	}
++	clean := func(text string) string {
++		return strings.Map(func(r rune) rune {
++			if unicode.IsControl(r) {
++				return ' '
++			}
++			return r
++		}, ansi.Strip(text))
++	}
++	screen := dialog.Screen{Kind: dialog.ScreenKind(clean(preview.Kind))}
++	for _, line := range preview.Lines {
++		screen.Lines = append(screen.Lines, clean(line))
++	}
++	for _, choice := range preview.Choices {
++		screen.Choices = append(screen.Choices, dialog.ScreenChoice{Label: clean(choice.Label), Cursor: choice.Cursor})
++	}
++	*c = screenCard{extension: preview, width: width, height: height, theme: renderGen,
++		lines: fitScreenCard(screen, width, height)}
++	return c.lines
++}
+--- a/internal/ui/extensions.go
++++ b/internal/ui/extensions.go
+@@ -44,6 +44,8 @@
+ 	// FoldHeaders makes the owner's header rows fold the session they head:
+ 	// see headfold.go.
+ 	FoldHeaders bool
++	PreviewRole string
++	ReadPreview func(string) (extension.SessionPreview, error)
+ }
+ 
+ // HeaderPane is an extension's page behind its header rows.
+@@ -383,7 +385,8 @@
+ 	m.extUIs = nil
+ 	m.extFilters = nil
+ 	for _, ui := range uis {
+-		kept := ExtensionUI{Owner: ui.Owner, OpenHeader: ui.OpenHeader, HeaderPane: ui.HeaderPane, FoldHeaders: ui.FoldHeaders}
++		kept := ExtensionUI{Owner: ui.Owner, OpenHeader: ui.OpenHeader, HeaderPane: ui.HeaderPane, FoldHeaders: ui.FoldHeaders,
++			PreviewRole: ui.PreviewRole, ReadPreview: ui.ReadPreview}
+ 		keys := append([]ExtensionKey(nil), ui.Keys...)
+ 		for _, filter := range ui.Filters {
+ 			listed := m.newListFilter(ui.Owner, filter)
+--- a/internal/ui/historysearch.go
++++ b/internal/ui/historysearch.go
+@@ -12,6 +12,7 @@
+ 
+ 	"github.com/usestring/gate-inbox/internal/config"
+ 	"github.com/usestring/gate-inbox/internal/logging"
++	"github.com/usestring/gate-inbox/internal/migrate"
+ 	"github.com/usestring/gate-inbox/internal/opencode"
+ 	"github.com/usestring/gate-inbox/internal/search"
+ 	"github.com/usestring/gate-inbox/internal/store"
+@@ -110,22 +111,9 @@
+ // as claude. A tool the index has no reader for keeps its own name and takes
+ // the generic reader.
+ func historyToolFormats(cfg config.Config) map[string]string {
+-	readers := map[string]bool{search.ToolClaude: true, search.ToolCodex: true, search.ToolOpenCode: true}
+ 	formats := make(map[string]string, len(cfg.Tools))
+ 	for name, tool := range cfg.Tools {
+-		format := tool.SessionStore
+-		if format == "" && readers[name] {
+-			format = name
+-		}
+-		if format == "" {
+-			if fields := strings.Fields(tool.Command); len(fields) > 0 {
+-				format = filepath.Base(fields[0])
+-			}
+-		}
+-		if format == "" {
+-			format = name
+-		}
+-		formats[name] = format
++		formats[name] = migrate.HistoryFormat(name, tool)
+ 	}
+ 	return formats
+ }
+--- a/internal/ui/previewquestions.go
++++ b/internal/ui/previewquestions.go
+@@ -8,6 +8,7 @@
+ 
+ 	"charm.land/lipgloss/v2"
+ 
++	"github.com/usestring/gate-inbox/extension"
+ 	"github.com/usestring/gate-inbox/extension/textfmt"
+ 	"github.com/usestring/gate-inbox/internal/asks"
+ 	"github.com/usestring/gate-inbox/internal/convo"
+@@ -320,20 +321,26 @@
+ 	if !ok {
+ 		return nil
+ 	}
+-	c.lines = screenCardLines(screen, width)
+-	if len(c.lines) > height {
+-		c.lines = append(c.lines[:max(0, height-1)], c.lines[len(c.lines)-1])
+-	}
++	c.lines = fitScreenCard(screen, width, height)
+ 	return c.lines
+ }
+ 
++func fitScreenCard(screen dialog.Screen, width, height int) []string {
++	lines := screenCardLines(screen, width)
++	if len(lines) > height {
++		return append(lines[:max(0, height-1)], lines[len(lines)-1])
++	}
++	return lines
++}
++
+ type screenCard struct {
+-	sessID string
+-	pane   string
+-	width  int
+-	height int
+-	theme  int
+-	lines  []string
++	sessID    string
++	extension *extension.PreviewDialog
++	pane      string
++	width     int
++	height    int
++	theme     int
++	lines     []string
+ }
+ 
+ func screenCardLines(screen dialog.Screen, width int) []string {

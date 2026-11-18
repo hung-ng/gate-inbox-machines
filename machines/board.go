@@ -73,12 +73,13 @@ type mirrors struct {
 	lastErr   map[string]string
 	skipped   map[string]int
 	// current is the mirrors this run of the board launched or reconnected.
-	current map[string]bool
-	wake    <-chan string
-	since   map[string]time.Time
-	stopped map[string]bool
-	owned   map[string]bool
-	tools   *toolCache
+	current  map[string]bool
+	wake     <-chan string
+	since    map[string]time.Time
+	stopped  map[string]bool
+	owned    map[string]bool
+	tools    *toolCache
+	previews *previewRoutes
 }
 
 // stateFile is the mirrors' saved state, in the extension's data dir.
@@ -202,6 +203,9 @@ func (m *mirrors) pass(ctx context.Context) {
 		}
 	}
 	m.state = next
+	if m.previews != nil {
+		m.previews.update(next, observed)
+	}
 	m.decorate(observed, local)
 }
 
