@@ -144,8 +144,10 @@ them stops.
 - If scrolling leaves a mirror in tmux scroll mode, press `q` inside it to type again. On the
   list, `q` quits your board.
 - `x` on the list, or `ctrl+x` inside a mirror once you confirm, closes the mirror and files its
-  row in the archive. The agent on the other machine keeps running. To get the mirror back, open
-  the archived view from the `:` menu, press `u` on its row, then confirm with `y` or Enter.
+  row in the archive. The agent on the other machine keeps running. The confirm prompt is Gate
+  Inbox's own and still reads "kill <row>?", about freeing its RAM; for a mirror only the local
+  row and its ssh connection close. To get the mirror back, open the archived view from the `:`
+  menu, press `u` on its row, then confirm with `y` or Enter.
 
 ## Start a session on another machine
 
@@ -166,6 +168,19 @@ environment of the process that starts a session into the session. A spawn run s
 would hand the agent SSH's bare PATH, and a CLI installed by Homebrew or in `~/.local/bin` would
 not be found. Polls skip the login shell, which keeps them fast. A greeting a login file prints
 before the reply is skipped.
+
+On a Mac, Claude Code keeps its sign-in in the login keychain, and nothing started from an SSH
+login can read it, even after that SSH connection closes. An agent `N` starts runs in a pane of
+that machine's agent tmux server, the board's `tmux_socket` or tmux's default server, so it
+can sign in only if that server was started outside SSH. If the server isn't running, the spawn
+starts it inside SSH, and Claude says "Not logged in" and suggests `security unlock-keychain`.
+There are two ways around this:
+
+- Keep that server running from the machine's desktop session, for example with a login item
+  that runs `tmux [-L <socket>] start-server \; set -s exit-empty off`. Every agent inherits that
+  server's environment, so start it with only what agents should see.
+- Run `claude setup-token` on that machine once, and export the token as
+  `CLAUDE_CODE_OAUTH_TOKEN` in its login shell.
 
 ## Scroll mode limitation
 
@@ -263,8 +278,22 @@ second far board and covered:
 between two Macs over real SSH, with the board on a MacBook mirroring a Mac mini whose login shell
 is zsh. The question showed on the MacBook, an answer typed there reached the agent on the mini,
 and the row went to finished. Restarting the board, reconnecting and archiving were checked on
-v1.1.0 too. A real adopted pane has not been tried: the fake agent is not a CLI the board adopts,
-so that case is covered by a test against a real tmux server instead.
+v1.1.0 too.
+
+The same two Macs then ran real Claude Code 2.1.327 and Codex 0.169.0 on a stock v1.1.0 board on
+the mini:
+
+- `N` started both, with Codex found only through the login shell
+- a Claude permission dialog showed as waiting on the MacBook, and was approved from the mirror
+- one Esc from the mirror declined another
+- `ctrl+x` archived the mirror and left the agent on the mini running, and restoring followed it
+  again
+- Codex went from working to finished on both boards
+- restarting either board brought the mirrors back
+- a Claude started by hand, which the mini's board adopted from another tmux server, was listed as
+  `not mirrored`
+
+Shift+enter through two tmux layers is still untested in a real terminal.
 
 ## License
 

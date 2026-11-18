@@ -149,13 +149,24 @@ var errNoSessions = errors.New("the board lent this command no session service")
 func tmuxSessions(ctx context.Context, run runner, argv []string) (map[string]bool, error) {
 	out, err := run(ctx, append(append([]string{}, argv...), "list-sessions", "-F", "#{session_name} #{session_attached}"))
 	if err != nil {
-		msg := err.Error()
-		if strings.Contains(msg, "no server running") || strings.Contains(msg, "error connecting to") {
+		if tmuxHasNothing(err) {
 			return map[string]bool{}, nil
 		}
 		return nil, fmt.Errorf("could not list tmux sessions: %w", err)
 	}
 	return parseTmuxSessions(string(out)), nil
+}
+
+// tmuxHasNothing is whether a failed tmux listing only means there was
+// nothing to list: no server on the socket, or a server kept up with no
+// sessions (exit-empty off), where list-panes -a fails with "no current
+// target". Keeping the agents' server up that way is how a Mac lets an agent
+// started over ssh read the login keychain, so it must not read as a failure.
+func tmuxHasNothing(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "no server running") ||
+		strings.Contains(msg, "error connecting to") ||
+		strings.Contains(msg, "no current target")
 }
 
 func parseTmuxSessions(out string) map[string]bool {
@@ -196,7 +207,7 @@ func boardRunning(dir string) bool {
 func tmuxScrolling(ctx context.Context, run runner, argv []string) (map[string]bool, error) {
 	out, err := run(ctx, append(append([]string{}, argv...), "list-panes", "-a", "-F", "#{session_name} #{pane_in_mode}"))
 	if err != nil {
-		if strings.Contains(err.Error(), "no server running") || strings.Contains(err.Error(), "error connecting to") {
+		if tmuxHasNothing(err) {
 			return map[string]bool{}, nil
 		}
 		return nil, fmt.Errorf("could not list tmux pane modes: %w", err)

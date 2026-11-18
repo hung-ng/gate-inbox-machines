@@ -83,3 +83,31 @@ func TestTmuxSessionsOnARealServer(t *testing.T) {
 		t.Errorf("no server: got %v, %v", got, err)
 	}
 }
+
+// A server kept up with no sessions (exit-empty off), the way an agents'
+// server is started ahead of its first agent, has nothing to list. tmux says
+// so differently per command: list-sessions prints nothing, list-panes -a
+// fails with "no current target".
+func TestTmuxListingsOnAnEmptyServer(t *testing.T) {
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("no tmux on PATH")
+	}
+	socket := filepath.Join(t.TempDir(), "s")
+	server := []string{tmux, "-f", "/dev/null", "-S", socket}
+	t.Cleanup(func() { _ = exec.Command(tmux, "-S", socket, "kill-server").Run() })
+	cmd := exec.Command(server[0], append(server[1:], "start-server", ";", "set", "-s", "exit-empty", "off")...)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("start an empty server: %v %s", err, out)
+	}
+	if out, err := exec.Command(tmux, "-S", socket, "show", "-s", "exit-empty").CombinedOutput(); err != nil {
+		t.Fatalf("the empty server did not stay up: %v %s", err, out)
+	}
+	if got, err := tmuxSessions(context.Background(), execRunner, server); err != nil || len(got) != 0 {
+		t.Errorf("sessions on an empty server: got %v, %v; want none and no error", got, err)
+	}
+	if got, err := tmuxScrolling(context.Background(), execRunner, server); err != nil || len(got) != 0 {
+		t.Errorf("pane modes on an empty server: got %v, %v; want none and no error", got, err)
+	}
+}
