@@ -58,21 +58,27 @@ const launchBackoff = 30 * time.Second
 
 // mirrors runs the reconcile loop on the board.
 type mirrors struct {
-	cfg     config
-	board   boardOps
-	ui      extension.UIHost
-	log     *slog.Logger
-	run     runner
-	path    string // the state file
-	now     func() time.Time
-	state   state
-	pinned  map[string]string
-	failed  map[string]time.Time
-	badges  map[string]string
-	lastErr map[string]string
-	skipped map[string]int
+	cfg       config
+	board     boardOps
+	ui        extension.UIHost
+	log       *slog.Logger
+	run       runner
+	observeMu sync.Mutex
+	path      string // the state file
+	now       func() time.Time
+	state     state
+	pinned    map[string]string
+	failed    map[string]time.Time
+	badges    map[string]string
+	lastErr   map[string]string
+	skipped   map[string]int
 	// current is the mirrors this run of the board launched or reconnected.
 	current map[string]bool
+	wake    <-chan string
+	since   map[string]time.Time
+	stopped map[string]bool
+	owned   map[string]bool
+	tools   *toolCache
 }
 
 func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logger, run runner, dataDir string) *mirrors {
@@ -86,6 +92,9 @@ func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logge
 		lastErr: map[string]string{},
 		skipped: map[string]int{},
 		current: map[string]bool{},
+		since:   map[string]time.Time{},
+		stopped: map[string]bool{},
+		owned:   map[string]bool{},
 	}
 	m.state = m.load()
 	return m
@@ -99,6 +108,7 @@ func (m *mirrors) loop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-m.wake:
 		case <-tick.C:
 		}
 	}
@@ -133,6 +143,7 @@ func (m *mirrors) pass(ctx context.Context) {
 			}
 			delete(m.pinned, a.LocalID)
 			delete(m.badges, a.LocalID)
+			delete(m.owned, a.LocalID)
 			delete(m.current, a.LocalID)
 		case actPin:
 			m.pin(ctx, a.LocalID, a.Status)
@@ -153,6 +164,7 @@ func (m *mirrors) pass(ctx context.Context) {
 			delete(m.failed, a.Key)
 			delete(m.pinned, a.LocalID)
 			delete(m.badges, a.LocalID)
+			delete(m.owned, a.LocalID)
 			delete(m.current, a.LocalID)
 			m.current[info.ID] = true
 			next.Mirrors[a.Key] = info.ID
@@ -212,6 +224,24 @@ func (m *mirrors) observe(ctx context.Context) []observation {
 		}()
 	}
 	wg.Wait()
+	for _, obs := range observed {
+		name := obs.Host.Name
+		if obs.Err != nil {
+			if m.since[name].IsZero() {
+				m.since[name] = m.now()
+			}
+		} else {
+			delete(m.since, name)
+			if m.tools != nil {
+				m.tools.set(name, obs.Snapshot.Tools)
+			}
+			stopped := !obs.Snapshot.boardRunning()
+			if stopped != m.stopped[name] {
+				m.log.Info("machine board running changed", "machine", name, "board_running", !stopped)
+			}
+			m.stopped[name] = stopped
+		}
+	}
 	return observed
 }
 
@@ -225,6 +255,8 @@ func (m *mirrors) observeOne(ctx context.Context, h host) observation {
 		obs.Snapshot, err = parseSnapshot(bytes.NewReader(out))
 	}
 	obs.Err = err
+	m.observeMu.Lock()
+	defer m.observeMu.Unlock()
 	// Say when a host goes away and when it comes back, not once a pass.
 	msg := ""
 	if err != nil {
@@ -305,21 +337,38 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 	}
 	reachable := map[string]bool{}
 	status := map[string]string{}
+	tools := map[string]string{}
+	scrolling := map[string]bool{}
+	stopped := map[string]bool{}
 	for _, obs := range observed {
 		reachable[obs.Host.Name] = obs.Err == nil
+		stopped[obs.Host.Name] = !obs.Snapshot.boardRunning()
 		for _, s := range obs.Snapshot.Sessions {
 			status[mirrorKey(obs.Host.Name, s.ID)] = s.Status
+			scrolling[mirrorKey(obs.Host.Name, s.ID)] = s.Scrolling
+			tools[mirrorKey(obs.Host.Name, s.ID)] = s.Tool
 		}
 	}
 	for _, key := range sortedKeys(m.state.Mirrors) {
 		id := m.state.Mirrors[key]
 		hostName, sessionID := splitKey(key)
-		badge := extension.Badge{Text: "⇄ " + hostName, Short: "⇄", Tone: extension.ToneAccent}
-		fact := hostName + " · " + status[key] + " · gi_" + sessionID
+		badge := extension.Badge{}
+		owned := !reachable[hostName] || stopped[hostName]
+		if m.owned[id] != owned {
+			m.ui.Own(id, owned)
+		}
+		m.owned[id] = owned
+		fact := hostName + " · " + tools[key] + " · " + status[key] + " · gi_" + sessionID
 		switch {
 		case !reachable[hostName]:
-			badge = extension.Badge{Text: "⇄ " + hostName + " offline", Short: "⇄ ✕", Tone: extension.ToneBad}
-			fact = hostName + " · unreachable · gi_" + sessionID
+			badge = extension.Badge{Text: "✕ " + hostName + " offline", Short: "✕", Tone: extension.ToneBad}
+			fact = hostName + " · unreachable since " + m.since[hostName].Format("15:04") + " · gi_" + sessionID
+		case stopped[hostName]:
+			badge = extension.Badge{Text: "✕ " + hostName + " board stopped", Short: "✕", Tone: extension.ToneBad}
+			fact = hostName + " · start that machine's board · gi_" + sessionID
+		case scrolling[key]:
+			badge = extension.Badge{Text: "↕ scroll mode", Short: "↕", Tone: extension.ToneWarn}
+			fact = hostName + " · " + tools[key] + " · " + status[key] + " · scroll mode: press q inside the mirror to type again · gi_" + sessionID
 		case local[id].ID != "" && !local[id].Running:
 			badge = extension.Badge{Text: "⇄ " + hostName + " detached", Short: "⇄ ·", Tone: extension.ToneWarn}
 		}
@@ -327,7 +376,11 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 			continue
 		}
 		m.badges[id] = badge.Text + fact
-		m.ui.Decorate(id, badge)
+		if badge.Text == "" {
+			m.ui.Decorate(id)
+		} else {
+			m.ui.Decorate(id, badge)
+		}
 		m.ui.Fact(id, extension.Fact{Label: "machine", Text: fact})
 	}
 }

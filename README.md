@@ -75,7 +75,7 @@ named `poll`, `ssh` or `control_path`:
 | `<name>.tmux_socket` | none | That board's `tmux_socket`, if it sets one |
 | `<name>.group` | top level | An existing group to file the machine's rows under. An extension cannot create a group, so make it first with `ctrl+alt+g` |
 
-The build also supplies a `[tools.machines]` block, which is the tool mirrors launch with. It shows
+The build also supplies a `[tools.mirror]` block, which is the tool mirrors launch with. It shows
 in the new-session picker. Starting it from there only prints a note saying to pick an agent CLI,
 and `machines sessions` never reports such a session. Uncheck it under Settings → CLIs to hide it.
 
@@ -83,10 +83,18 @@ and `machines sessions` never reports such a session. Uncheck it under Settings 
 
 - A mirror row is named after its machine and the session there, such as
   `mini-upgrade-http-client`, since the board's main list shows a row's name and tool but not its
-  badges. In the sidebar it carries a `⇄ mini` badge. The detail panel
-  has a `machine` line with the machine, the session's status there and its tmux session.
-- When a machine can't be reached, its rows keep their last status and the badge reads
-  `⇄ mini offline`. Nothing is archived or relaunched until the machine answers again.
+  badges. Healthy mirrors have no badge. The detail panel has a `machine` line such as
+  `mini · claude · waiting · gi_ab12`.
+- When a machine can't be reached, its running mirrors are pinned to `errored`, with a
+  `✕ mini offline` badge and a detail line giving the time it became unreachable. This is a
+  stand-in status that keeps the connection problem visible in every layout, not a claim that
+  the agent failed. The extension owns those rows so they stay out of triage, the attention
+  filter and Tab jumps. Nothing is archived or relaunched until the machine answers again.
+- A reachable machine whose board stopped gets the same treatment, with
+  `✕ mini board stopped` and a detail line asking you to start its board. Agent processes can
+  keep running after their board quits, but their saved statuses cannot be trusted. The PID in the config
+  directory's `manager.lock` indicates whether the board process is alive. Recovery restores the real status
+  and releases ownership.
 - If a mirror can't attach, its pane says why (the connection dropped, no tmux on the PATH, tmux
   refused the target) and tries again with backoff (1s, 2s, 4s, up to 30s). The row stays, and the
   board's log names the reason once. A mirror's pane never exits on its own: a pane whose command
@@ -100,12 +108,46 @@ and `machines sessions` never reports such a session. Uncheck it under Settings 
 - The board's log records each mirror the extension starts, reconnects, archives or sees put away,
   with the reason.
 
+## Start a session on another machine
+
+Press `N` on the list to open the machine form immediately. With one configured machine,
+Machine is preselected and CLI, Task and Directory appear together. With several machines,
+choose one and press Enter before filling the remaining fields. The v1.1.0 form API does not
+report picker changes, so changing machines also requires Enter to refresh the CLI choices.
+An empty directory uses that board's default. Enter or ctrl+s submits.
+
+CLI choices come from each machine's most recent successful poll. Without a list yet, the
+CLI field accepts a typed name. Discovery lists configured tools except shells, terminal and
+both mirror names, regardless of the non-interactive SSH PATH. If a CLI is not installed,
+spawn's error appears in the status bar.
+
+Submission runs `spawn --nest=false` over non-interactive SSH and wakes the poll immediately.
+Both machines should run this build to report board liveness. An older reply without
+`board_running` is treated as running. Detection only reads the singleton PID and checks
+process existence. It never locks `manager.lock`, since a lock probe could trigger takeover
+in a board starting concurrently.
+
+## Scroll mode limitation
+
+Scrolling with the mouse or trackpad inside a focused mirror can put the session's pane on the
+other machine into tmux's scroll mode. While it is there, what you type goes to the scrolling,
+not to the agent. The row then shows a `↕ scroll mode` warning, and its detail line says to press
+`q` inside the mirror, which leaves scroll mode. An offline or stopped-board warning takes
+precedence over this one.
+
+The cause: tmux on the other machine turns on mouse reporting in the mirror's pane, so wheel
+events travel over SSH and reach it. A test with tmux 3.8 showed this, and changing `TERM` did
+not stop it. The extension changes no tmux settings on the other machine, since its board owns
+them. A full fix would sit between SSH and the pane and filter out the mouse-reporting
+sequences, which is left as future work.
+
 ## Safety
 
 - **Nothing listens on a port.** Everything goes over SSH with your key, so the extension can
   reach on a machine exactly what you could by SSH-ing in.
-- **Nothing reaches an agent on another machine except what you type into its focused mirror.**
-  The `machines` tool block declares no `activity_cutoff`, so the board refuses to queue messages,
+- **Only focused mirror input reaches an existing agent on another machine.**
+  Starting a new agent through the machine form is an explicit operator action.
+  The `mirror` tool block declares no `activity_cutoff`, so the board refuses to queue messages,
   snippets or naming requests into a mirror. Anything queued there would skip the checks that
   machine's board makes on when an agent can safely read input. `skip_rename_directive` and
   `mcp = "none"` keep the board's naming request and its MCP server out of the pane. Don't add an

@@ -5,10 +5,10 @@ go 1.27.4
 require github.com/usestring/gate-inbox v1.1.0
 
 require (
+	github.com/BurntSushi/toml v1.6.0 // indirect
 	charm.land/bubbles/v2 v2.2.0 // indirect
 	charm.land/bubbletea/v2 v2.0.9 // indirect
 	charm.land/lipgloss/v2 v2.0.6 // indirect
-	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260811164956-006e29f97886 // indirect

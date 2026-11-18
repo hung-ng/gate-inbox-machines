@@ -6,8 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/usestring/gate-inbox/extension"
 )
@@ -21,17 +25,20 @@ const wireVersion = 1
 // snapshot is what `machines sessions --json` prints: the agent sessions a
 // host's board is running, as that board reads them.
 type snapshot struct {
-	Version  int              `json:"version"`
-	Sessions []machineSession `json:"sessions"`
+	BoardRunning *bool            `json:"board_running,omitempty"`
+	Tools        []string         `json:"tools,omitempty"`
+	Version      int              `json:"version"`
+	Sessions     []machineSession `json:"sessions"`
 }
 
 type machineSession struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Tool    string `json:"tool"`
-	Group   string `json:"group,omitempty"`
-	Status  string `json:"status"`
-	Running bool   `json:"running"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Tool      string `json:"tool"`
+	Group     string `json:"group,omitempty"`
+	Status    string `json:"status"`
+	Running   bool   `json:"running"`
+	Scrolling bool   `json:"scrolling,omitempty"`
 	// Attachable is whether the session has a tmux session of its own,
 	// gi_<id>, on the tmux server the host's mirrors attach through. A
 	// session the board launched does. A pane the board adopted as it was,
@@ -72,7 +79,7 @@ func listSessions(ctx context.Context, sessions extension.SessionService, attach
 			// A session on the machines tool without the mirror role is one
 			// somebody started from the picker by hand: an attach with
 			// nothing to attach to, not an agent.
-			if s.Terminal || s.Archived || s.Role == mirrorRole || s.Tool == toolName {
+			if s.Terminal || s.Archived || s.Role == mirrorRole || s.Tool == toolName || s.Tool == "machines" {
 				continue
 			}
 			snap.Sessions = append(snap.Sessions, machineSession{
@@ -140,7 +147,7 @@ var errNoSessions = errors.New("the board lent this command no session service")
 // an error, so a host whose tmux cannot be run reads as unreachable with
 // the reason, rather than as a board with nothing to mirror.
 func tmuxSessions(ctx context.Context, run runner, argv []string) (map[string]bool, error) {
-	out, err := run(ctx, append(append([]string{}, argv...), "list-sessions", "-F", "#{session_name}"))
+	out, err := run(ctx, append(append([]string{}, argv...), "list-sessions", "-F", "#{session_name} #{session_attached}"))
 	if err != nil {
 		msg := err.Error()
 		if strings.Contains(msg, "no server running") || strings.Contains(msg, "error connecting to") {
@@ -154,9 +161,59 @@ func tmuxSessions(ctx context.Context, run runner, argv []string) (map[string]bo
 func parseTmuxSessions(out string) map[string]bool {
 	ids := map[string]bool{}
 	for _, line := range strings.Split(out, "\n") {
-		if id, ok := strings.CutPrefix(strings.TrimSpace(line), "gi_"); ok && sessionIDPattern.MatchString(id) {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if id, ok := strings.CutPrefix(fields[0], "gi_"); ok && sessionIDPattern.MatchString(id) {
 			ids[id] = true
 		}
 	}
 	return ids
+}
+
+// Missing board_running predates board detection and must not suppress mirrors.
+func (s snapshot) boardRunning() bool { return s.BoardRunning == nil || *s.BoardRunning }
+
+func boolPtr(v bool) *bool { return &v }
+
+// Only read the singleton PID. Even a brief flock probe can make a starting
+// board take its takeover path and signal the PID recorded here.
+func boardRunning(dir string) bool {
+	data, err := os.ReadFile(filepath.Join(dir, "manager.lock"))
+	if err != nil {
+		return false
+	}
+	first, _, _ := strings.Cut(string(data), "\n")
+	pid, err := strconv.Atoi(strings.TrimSpace(first))
+	if err != nil || pid <= 0 || pid > 1<<31-1 {
+		return false
+	}
+	err = syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func tmuxScrolling(ctx context.Context, run runner, argv []string) (map[string]bool, error) {
+	out, err := run(ctx, append(append([]string{}, argv...), "list-panes", "-a", "-F", "#{session_name} #{pane_in_mode}"))
+	if err != nil {
+		if strings.Contains(err.Error(), "no server running") || strings.Contains(err.Error(), "error connecting to") {
+			return map[string]bool{}, nil
+		}
+		return nil, fmt.Errorf("could not list tmux pane modes: %w", err)
+	}
+	return parseTmuxScrolling(string(out)), nil
+}
+
+func parseTmuxScrolling(out string) map[string]bool {
+	modes := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[1] != "1" {
+			continue
+		}
+		if id, ok := strings.CutPrefix(fields[0], "gi_"); ok && sessionIDPattern.MatchString(id) {
+			modes[id] = true
+		}
+	}
+	return modes
 }

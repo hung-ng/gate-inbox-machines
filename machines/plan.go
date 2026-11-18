@@ -136,7 +136,16 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 	}
 
 	for _, obs := range observed {
-		if obs.Err != nil {
+		if obs.Err != nil || !obs.Snapshot.boardRunning() {
+			// Errored keeps a transport failure visible in every layout. It is a
+			// stand-in for unavailable status, not a claim about the agent.
+			for _, key := range sortedKeys(next.Mirrors) {
+				id := next.Mirrors[key]
+				name, _ := splitKey(key)
+				if name == obs.Host.Name && local[id].Running && pinned[id] != "errored" {
+					actions = append(actions, action{Kind: actPin, Key: key, LocalID: id, Status: "errored"})
+				}
+			}
 			continue
 		}
 		live := map[string]machineSession{}

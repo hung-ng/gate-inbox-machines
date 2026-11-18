@@ -59,6 +59,25 @@ func TestTmuxSessionsOnARealServer(t *testing.T) {
 	if len(got) != 1 || !got["ab12"] {
 		t.Errorf("attachable = %v, want ab12 only", got)
 	}
+
+	modes, err := tmuxScrolling(context.Background(), execRunner, server)
+	if err != nil || modes["ab12"] {
+		t.Fatal(modes, err)
+	}
+	if _, err := execRunner(context.Background(), append(append([]string{}, server...), "copy-mode", "-t", "gi_ab12")); err != nil {
+		t.Fatal(err)
+	}
+	modes, err = tmuxScrolling(context.Background(), execRunner, server)
+	if err != nil || !modes["ab12"] {
+		t.Fatal(modes, err)
+	}
+	if _, err := execRunner(context.Background(), append(append([]string{}, server...), "send-keys", "-t", "gi_ab12", "-X", "cancel")); err != nil {
+		t.Fatal(err)
+	}
+	modes, err = tmuxScrolling(context.Background(), execRunner, server)
+	if err != nil || modes["ab12"] {
+		t.Fatal(modes, err)
+	}
 	none := []string{tmux, "-f", "/dev/null", "-S", filepath.Join(t.TempDir(), "none")}
 	if got, err := tmuxSessions(context.Background(), execRunner, none); err != nil || len(got) != 0 {
 		t.Errorf("no server: got %v, %v", got, err)

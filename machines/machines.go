@@ -30,7 +30,7 @@ const (
 	extensionID = "machines"
 	// toolName is the [tools.<name>] block mirrors launch with; ConfigDefaults
 	// supplies it.
-	toolName = "machines"
+	toolName = "mirror"
 	// Version is this extension's own version, in the board's log.
 	Version = "0.1.0"
 	program = "gate-inbox"
@@ -48,7 +48,7 @@ const (
 // board's naming request out of the pane for the same reason, and mcp
 // "none" keeps it from registering an MCP server for a process that is
 // only ssh.
-const ConfigDefaults = `[tools.machines]
+const ConfigDefaults = `[tools.mirror]
 command = "sh -c 'exec \"${GATE_INBOX_BIN:-gate-inbox}\" machines attach \"$@\"' --"
 default_status = "idle"
 mcp = "none"
@@ -62,11 +62,13 @@ type Extension struct {
 	ui     extension.UIHost
 	run    runner
 	attach attachRunner
+	wake   chan string
+	tools  toolCache
 }
 
 // New returns the extension, to list in app.Options.Extensions.
 func New() *Extension {
-	return &Extension{run: execRunner, attach: execAttach}
+	return &Extension{run: execRunner, attach: execAttach, wake: make(chan string, 1)}
 }
 
 func (e *Extension) Descriptor() extension.Descriptor {
@@ -105,7 +107,7 @@ func (e *Extension) Roles() []extension.RoleSpec {
 
 func (e *Extension) UI(host extension.UIHost) (extension.UI, error) {
 	e.ui = host
-	return extension.UI{}, nil
+	return e.machineUI(), nil
 }
 
 // StartBoard runs the mirror loop for as long as the board does. It does
@@ -122,6 +124,8 @@ func (e *Extension) StartBoard(ctx context.Context, board extension.BoardHost) (
 		return nil, err
 	}
 	m := newMirrors(e.cfg, board, e.ui, board.Logger(), e.run, dataDir)
+	m.wake = e.wake
+	m.tools = &e.tools
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -183,6 +187,18 @@ func (e *Extension) runSessions(ctx context.Context, args []string, host extensi
 		return err
 	}
 	snap, err := listSessions(ctx, host.Sessions(), attachable)
+	if err != nil {
+		return err
+	}
+	snap.BoardRunning = boolPtr(boardRunning(host.ConfigDir()))
+	scrolling, err := tmuxScrolling(ctx, e.run, tmuxArgv)
+	if err != nil {
+		return err
+	}
+	for i := range snap.Sessions {
+		snap.Sessions[i].Scrolling = scrolling[snap.Sessions[i].ID]
+	}
+	snap.Tools, err = availableTools(ctx, host)
 	if err != nil {
 		return err
 	}

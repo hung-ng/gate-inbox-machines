@@ -14,7 +14,7 @@ var mini = host{Name: "mini", Destination: "mini", GateInbox: "gate-inbox", Tmux
 var box = host{Name: "box", Destination: "box", GateInbox: "gate-inbox", Tmux: "tmux", Group: "box"}
 
 func seen(h host, sessions ...machineSession) observation {
-	return observation{Host: h, Snapshot: snapshot{Version: wireVersion, Sessions: sessions}}
+	return observation{Host: h, Snapshot: snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: sessions}}
 }
 
 func unreachable(h host) observation {
@@ -117,7 +117,8 @@ func TestPlan(t *testing.T) {
 		local:    rows(mirrorRow("l1", true)),
 		want:     []string{"archive l1"},
 	}, {
-		name:        "an unreachable host keeps its mirrors as they are",
+		name:        "an unreachable host keeps its mirrors visible",
+		want:        []string{"pin l1 errored"},
 		prev:        withMirrors("mini/a1", "l1"),
 		observed:    []observation{unreachable(mini)},
 		local:       rows(mirrorRow("l1", true)),
@@ -183,7 +184,7 @@ func TestPlan(t *testing.T) {
 		observed:    []observation{seen(mini, live("a1", "idle")), unreachable(box)},
 		local:       rows(mirrorRow("l2", true)),
 		pinned:      map[string]string{"l2": "working"},
-		want:        []string{"launch mini/a1 as idle"},
+		want:        []string{"launch mini/a1 as idle", "pin l2 errored"},
 		wantMirrors: map[string]string{"box/b1": "l2"},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
