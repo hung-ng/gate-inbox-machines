@@ -111,10 +111,7 @@ func TestAttachLoopStopsWithItsContext(t *testing.T) {
 }
 
 func TestRunAttachDropsTheEmptyPromptAndChecksItsOperands(t *testing.T) {
-	e, err := configure(t, map[string]any{"control_path": "none", "mini": map[string]any{}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	e := newManaged(t, healthyFar(), mini)
 	var argv []string
 	ctx, cancel := context.WithCancel(context.Background())
 	e.attach = func(_ context.Context, a []string) (int, error) { argv = a; cancel(); return 1, nil }

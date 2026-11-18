@@ -1,13 +1,11 @@
 package machines
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -87,18 +85,26 @@ func (f *farMachine) setErr(err error) {
 	f.sshErr = err
 }
 
-// newManaged is an extension with a data dir, config.toml's machines base,
-// and far answering for every machine.
-func newManaged(t *testing.T, far *farMachine, base ...host) *Extension {
+// machineStore writes the registry fixture before the board reads it.
+func machineStore(t *testing.T, dir string, machines ...host) string {
 	t.Helper()
-	dir := t.TempDir()
-	e := New()
-	e.conf = extension.NewConfig(nil).WithDataDir(dir)
-	for i := range base {
-		base[i].Source = sourceConfig
+	store := storeFile{Machines: map[string]hostSettings{}}
+	for _, h := range machines {
+		store.Machines[h.Name] = hostSettings{Destination: h.Destination, GateInbox: h.Settings.GateInbox, Home: h.Home, Group: h.Group}
 	}
-	e.cfg = config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none", Hosts: base}
-	e.reg = newRegistry(base, dir)
+	if err := writeJSON(filepath.Join(dir, storeFileName), store); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func newManaged(t *testing.T, far *farMachine, machines ...host) *Extension {
+	t.Helper()
+	dir := machineStore(t, t.TempDir(), machines...)
+	e := New()
+	if err := e.Configure(extension.NewConfig(map[string]any{"control_path": "none"}).WithDataDir(dir)); err != nil {
+		t.Fatal(err)
+	}
 	e.run = far.run
 	return e
 }
@@ -111,21 +117,16 @@ func TestAboutCleanDropsWhatItCantUse(t *testing.T) {
 	}
 }
 
-func TestOperatorSettingsWinOverWhatAMachineSays(t *testing.T) {
+func TestMachineReportsTmuxAndOperatorSetsGateInbox(t *testing.T) {
 	socket := "agents"
 	said := about{GateInbox: "/far/gate-inbox", Tmux: "/far/tmux", TmuxSocket: &socket}
-	h, _ := resolveHost("box", hostSettings{Tmux: "/mine/tmux"})
+	h, _ := resolveHost("box", hostSettings{GateInbox: "/mine/gate-inbox"})
 	h = h.withAbout(said)
-	if h.Tmux != "/mine/tmux" || h.GateInbox != "/far/gate-inbox" || h.TmuxSocket != "agents" {
+	if h.Tmux != "/far/tmux" || h.GateInbox != "/mine/gate-inbox" || h.TmuxSocket != "agents" {
 		t.Fatalf("%+v", h)
 	}
-	h, _ = resolveHost("box", hostSettings{TmuxSocket: "mine"})
-	if h = h.withAbout(said); h.TmuxSocket != "mine" {
-		t.Fatal(h.TmuxSocket)
-	}
 	empty := ""
-	h, _ = resolveHost("box", hostSettings{})
-	if h = h.withAbout(about{TmuxSocket: &empty}); h.TmuxSocket != "" || h.GateInbox != "gate-inbox" {
+	if h = h.withAbout(about{TmuxSocket: &empty}); h.TmuxSocket != "" {
 		t.Fatalf("%+v", h)
 	}
 }
@@ -137,7 +138,7 @@ func TestSuggestName(t *testing.T) {
 		{"Box-1.local", "", "box-1"},
 		{"", "me@Box.Example.com", "box"},
 		{"", "10.0.0.7", "m-10"},
-		{"poll", "poll.example", "machine"},
+		{"poll", "poll.example", "poll"},
 		{"", "", "machine"},
 	} {
 		if got := suggestName(tc.hostname, tc.destination, none); got != tc.want {
@@ -196,78 +197,51 @@ func TestAddNamesTheMachineAfterItsHostnameAndLearnsItsPaths(t *testing.T) {
 	far := healthyFar()
 	e := newManaged(t, far, mini)
 	var out bytes.Buffer
-	h, err := e.addMachine(context.Background(), addOptions{Destination: "me@box.example"}, &out, nil)
+	h, err := e.addMachine(context.Background(), addOptions{Destination: "me@box.example"}, &out)
 	if err != nil {
 		t.Fatal(err, out.String())
 	}
-	if h.Name != "box-1" || h.Source != sourceAdded || h.GateInbox != "/home/me/go/bin/gate-inbox" || h.Tmux != "/usr/bin/tmux" {
+	if h.Name != "box-1" || h.GateInbox != "/home/me/go/bin/gate-inbox" || h.Tmux != "/usr/bin/tmux" {
 		t.Fatalf("%+v\n%s", h, out.String())
 	}
 	if !strings.Contains(out.String(), "it reports hostname Box-1.local") {
 		t.Fatal(out.String())
 	}
 	// Another process of this build reads the same files.
-	other := newRegistry([]host{mini}, e.reg.dir)
+	other := newRegistry(e.reg.dir)
 	if got, ok := other.host("box-1"); !ok || got.Tmux != "/usr/bin/tmux" {
 		t.Fatalf("%+v", got)
 	}
 	for _, opts := range []addOptions{
 		{Destination: "me@box.example"},
 		{Destination: "other", Name: "mini"},
-		{Destination: "other", Name: "poll"},
 		{Destination: "-oProxyCommand=x"},
 		{Destination: "two words"},
 	} {
-		if _, err := e.addMachine(context.Background(), opts, &out, nil); err == nil {
+		if _, err := e.addMachine(context.Background(), opts, &out); err == nil {
 			t.Errorf("%+v was added", opts)
 		}
 	}
 }
 
-func TestAddStopsAtAKeyItNeedsATerminalFor(t *testing.T) {
-	far := healthyFar()
-	far.sshErr = errors.New("exit status 255: me@box: Permission denied (publickey).")
-	e := newManaged(t, far)
-	var out bytes.Buffer
-	_, err := e.addMachine(context.Background(), addOptions{Destination: "me@box"}, &out, nil)
-	var needs errNeedsTerminal
-	if !errors.As(err, &needs) || needs.Fix != fixKey {
-		t.Fatal(err)
-	}
-	if len(e.machines().all()) != 0 {
-		t.Fatal("added a machine it can't log in to")
-	}
-	var ran [][]string
-	term := &terminal{in: bufioReader("\n"), out: &out, run: func(_ context.Context, argv []string) (int, error) {
-		ran = append(ran, argv)
-		far.setErr(nil)
-		return 0, nil
-	}}
-	h, err := e.addMachine(context.Background(), addOptions{Destination: "me@box"}, &out, term)
-	if err != nil || h.Name != "box-1" {
-		t.Fatal(err, out.String())
-	}
-	if len(ran) != 1 || strings.Join(ran[0], " ") != "ssh-copy-id me@box" {
-		t.Fatal(ran)
-	}
-}
-
-func TestAddAcceptsAHostKeyAtATerminal(t *testing.T) {
-	far := healthyFar()
-	far.sshErr = errors.New("exit status 255: Host key verification failed.")
-	e := newManaged(t, far)
-	var ran []string
-	var out bytes.Buffer
-	term := &terminal{in: bufioReader("y\n"), out: &out, run: func(_ context.Context, argv []string) (int, error) {
-		ran = argv
-		far.setErr(nil)
-		return 0, nil
-	}}
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out, term); err != nil {
-		t.Fatal(err, out.String())
-	}
-	if strings.Join(ran, " ") != "ssh -o BatchMode=no -o ControlPath=none -- box true" {
-		t.Fatal(ran)
+func TestAddPrintsTheCommandForAnSSHFailure(t *testing.T) {
+	for _, tc := range []struct{ failure, command string }{
+		{"Permission denied (publickey).", "ssh-copy-id me@box"},
+		{"Host key verification failed.", "ssh me@box true"},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			far := healthyFar()
+			far.sshErr = errors.New(tc.failure)
+			e := newManaged(t, far)
+			var out bytes.Buffer
+			_, err := e.addMachine(context.Background(), addOptions{Destination: "me@box"}, &out)
+			if err == nil || !strings.Contains(out.String(), "`"+tc.command+"`") {
+				t.Fatal(err, out.String())
+			}
+			if len(e.machines().all()) != 0 || len(far.calls) != 1 {
+				t.Fatal(e.machines().all(), far.calls)
+			}
+		})
 	}
 }
 
@@ -276,10 +250,10 @@ func TestAddRefusesABrokenMachineUnlessForced(t *testing.T) {
 	far.hidden = true
 	e := newManaged(t, far)
 	var out bytes.Buffer
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out, nil); err == nil || !strings.Contains(err.Error(), "--force") {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out); err == nil || !strings.Contains(err.Error(), "--force") {
 		t.Fatal(err, out.String())
 	}
-	h, err := e.addMachine(context.Background(), addOptions{Destination: "box", Force: true}, &out, nil)
+	h, err := e.addMachine(context.Background(), addOptions{Destination: "box", Force: true}, &out)
 	if err != nil || h.Name != "box" {
 		t.Fatal(err)
 	}
@@ -290,7 +264,7 @@ func TestAddFindsGateInboxThroughTheLoginShell(t *testing.T) {
 	far.hidden, far.loginPath = true, "/home/me/go/bin/gate-inbox"
 	e := newManaged(t, far)
 	var out bytes.Buffer
-	h, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out, nil)
+	h, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out)
 	if err != nil {
 		t.Fatal(err, out.String())
 	}
@@ -304,7 +278,7 @@ func TestAddKeepsAMachineWhoseBoardIsStopped(t *testing.T) {
 	far.snap.BoardRunning = boolPtr(false)
 	e := newManaged(t, far)
 	var out bytes.Buffer
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out); err != nil {
 		t.Fatal(err, out.String())
 	}
 	if !strings.Contains(out.String(), "board running FAIL") {
@@ -329,11 +303,11 @@ func TestCheckWarnsWhenTheBuildsDiffer(t *testing.T) {
 	}
 }
 
-func TestRemovePauseAndRename(t *testing.T) {
+func TestRemovePauseAndResume(t *testing.T) {
 	far := healthyFar()
 	e := newManaged(t, far, mini)
 	var out bytes.Buffer
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box"}, &out, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box"}, &out); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.pauseMachine("mini", true); err != nil {
@@ -345,34 +319,28 @@ func TestRemovePauseAndRename(t *testing.T) {
 	if err := e.pauseMachine("nobody", true); err == nil {
 		t.Fatal("paused a machine that isn't there")
 	}
-	if err := e.renameMachine("mini", "mini2"); err == nil {
-		t.Fatal("renamed a machine config.toml names")
-	}
-	if err := e.renameMachine("box", "mini"); err == nil {
-		t.Fatal("renamed onto a taken name")
-	}
-	if err := e.renameMachine("box", "big"); err != nil {
+	if err := e.removeMachine("box"); err != nil {
 		t.Fatal(err)
 	}
-	if h, ok := e.machines().host("big"); !ok || h.About == nil || h.Tmux != "/usr/bin/tmux" {
-		t.Fatal("the new name lost what the machine said", h)
-	}
-	if err := e.removeMachine("mini"); err == nil || !strings.Contains(err.Error(), "config.toml") {
-		t.Fatal(err)
-	}
-	if err := e.removeMachine("big"); err != nil {
-		t.Fatal(err)
+	if err := e.removeMachine("box"); err == nil {
+		t.Fatal("removed an unknown machine")
 	}
 	if all := e.machines().all(); len(all) != 1 || all[0].Name != "mini" || !all[0].Paused {
 		t.Fatal(all)
+	}
+	if err := e.pauseMachine("mini", false); err != nil {
+		t.Fatal(err)
+	}
+	if active := e.machines().active(); len(active) != 1 || active[0].Name != "mini" {
+		t.Fatal(active)
 	}
 }
 
 func TestRegistryFollowsOtherProcesses(t *testing.T) {
 	dir := t.TempDir()
-	board := newRegistry(nil, dir)
-	shell := newRegistry(nil, dir)
-	if err := shell.change(func(s *storeFile, _ []host) error {
+	board := newRegistry(dir)
+	shell := newRegistry(dir)
+	if err := shell.change(func(s *storeFile) error {
 		s.Machines["box"] = hostSettings{Destination: "me@box"}
 		return nil
 	}); err != nil {
@@ -391,7 +359,7 @@ func TestRegistryFollowsOtherProcesses(t *testing.T) {
 		t.Fatal("one process's learning overwrote another's", h)
 	}
 	// What a machine said under a destination it no longer has is ignored.
-	shell.change(func(s *storeFile, _ []host) error {
+	shell.change(func(s *storeFile) error {
 		s.Machines["box"] = hostSettings{Destination: "me@elsewhere"}
 		return nil
 	})
@@ -407,12 +375,11 @@ func TestRegistryFollowsOtherProcesses(t *testing.T) {
 	}
 }
 
-func TestConfigWinsANameClash(t *testing.T) {
+func TestRegistryReportsAnInvalidMachine(t *testing.T) {
 	dir := t.TempDir()
-	base := []host{{Name: "mini", Destination: "from-config", GateInbox: "gate-inbox", Tmux: "tmux", Source: sourceConfig}}
 	os.WriteFile(filepath.Join(dir, storeFileName), []byte(`{"machines":{"mini":{"destination":"from-store"},"Bad Name":{"destination":"x"}}}`), 0o600)
-	r := newRegistry(base, dir)
-	if all := r.all(); len(all) != 1 || all[0].Destination != "from-config" {
+	r := newRegistry(dir)
+	if all := r.all(); len(all) != 1 || all[0].Destination != "from-store" {
 		t.Fatal(all)
 	}
 	if !strings.Contains(r.issue(), "Bad Name") {
@@ -435,8 +402,8 @@ func TestPollLearnsTheBoardsSocketAndAsksAgain(t *testing.T) {
 		return json.Marshal(snap)
 	}
 	b := newFakeBoard()
-	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none", Hosts: []host{mini}}
-	m := newMirrors(cfg, b, nil, quiet(), run, t.TempDir())
+	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
+	m := newMirrors(cfg, b, nil, quiet(), run, machineStore(t, t.TempDir(), mini))
 	m.pass(context.Background())
 	if len(asked) != 2 || !strings.Contains(asked[1], "--tmux /opt/homebrew/bin/tmux --tmux-socket agents") {
 		t.Fatal(asked)
@@ -472,19 +439,17 @@ func TestPollHostTriesTheLoginShellOnce(t *testing.T) {
 	}
 }
 
-func TestPassPutsAwayAPausedMachinesMirrorsAndClosesFinishedSetupRows(t *testing.T) {
+func TestPassPutsAwayAPausedMachinesMirrors(t *testing.T) {
 	dir := t.TempDir()
 	b := newFakeBoard()
-	b.sessions["s1"] = extension.SessionInfo{ID: "s1", Tool: toolName, Role: setupRole, Running: false}
-	b.sessions["s2"] = extension.SessionInfo{ID: "s2", Tool: toolName, Role: setupRole, Running: true}
 	replies := hosts{"mini": snapshot{Version: wireVersion, BoardRunning: boolPtr(true), Sessions: []machineSession{live("a1", "waiting")}}}
-	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none", Hosts: []host{mini}}
-	m := newMirrors(cfg, b, nil, quiet(), replies.run, dir)
+	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
+	m := newMirrors(cfg, b, nil, quiet(), replies.run, machineStore(t, dir, mini))
 	m.pass(context.Background())
-	if len(b.launches) != 1 || !slices.Contains(b.archives, "s1") || slices.Contains(b.archives, "s2") {
+	if len(b.launches) != 1 || len(b.archives) != 0 {
 		t.Fatal(b.launches, b.archives)
 	}
-	m.reg.change(func(s *storeFile, _ []host) error {
+	m.reg.change(func(s *storeFile) error {
 		s.Paused = append(s.Paused, "mini")
 		return nil
 	})
@@ -532,77 +497,6 @@ func TestDiscoverCommand(t *testing.T) {
 		t.Fatal(got, err)
 	}
 }
-
-func TestProbeSummary(t *testing.T) {
-	for _, tc := range []struct {
-		snap  snapshot
-		err   error
-		want  string
-		ready bool
-	}{
-		{snapshot{BoardRunning: boolPtr(true)}, nil, "ready, board running", true},
-		{snapshot{BoardRunning: boolPtr(false)}, nil, "ready, board stopped", true},
-		{snapshot{}, exitStatus(commandNotFound), "no gate-inbox found there", false},
-		{snapshot{}, errors.New("Permission denied (publickey)"), "needs your SSH key", false},
-		{snapshot{}, errors.New("Host key verification failed."), "host key not accepted yet", false},
-		{snapshot{}, errors.New("the machine's reply is not a session list: x"), "runs a gate-inbox without this extension", false},
-		{snapshot{}, errors.New("Connection timed out"), "can't connect", false},
-	} {
-		if got, ready := probeSummary(tc.snap, tc.err); got != tc.want || ready != tc.ready {
-			t.Errorf("%v: %q %v", tc.err, got, ready)
-		}
-	}
-}
-
-// start-board's command must reach tmux word for word through each login
-// shell, home and all.
-func TestStartBoardThroughShells(t *testing.T) {
-	for _, shell := range []string{"zsh", "bash", "sh"} {
-		t.Run(shell, func(t *testing.T) {
-			path, err := exec.LookPath(shell)
-			if err != nil {
-				t.Skip(shell)
-			}
-			home := t.TempDir()
-			tmux := filepath.Join(home, "tmux")
-			if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			h := host{Destination: "box", Tmux: tmux, GateInbox: "/far/bin/gate-inbox", Home: "~/gi home"}
-			argv := startBoardArgv(config{SSH: []string{"ssh"}, ControlPath: "none"}, h)
-			cmd := exec.Command(path, "-c", argv[len(argv)-1])
-			cmd.Env = []string{"HOME=" + home, "SHELL=" + path, "PATH=/usr/bin:/bin"}
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatal(err, string(out))
-			}
-			want := "new-session\n-d\n-s\ngate-inbox-board\n--\nenv\nGATE_INBOX_HOME=" + home + "/gi home\n/far/bin/gate-inbox\n"
-			if string(out) != want {
-				t.Fatalf("%q\nwant %q", out, want)
-			}
-		})
-	}
-}
-
-func TestStartBoardSkipsARunningBoard(t *testing.T) {
-	far := healthyFar()
-	e := newManaged(t, far, mini)
-	msg, err := e.startBoard(context.Background(), mini)
-	if err != nil || !strings.Contains(msg, "already running") {
-		t.Fatal(msg, err)
-	}
-	far.snap.BoardRunning = boolPtr(false)
-	far.snap.About.OS = "darwin"
-	msg, err = e.startBoard(context.Background(), mini)
-	if err != nil || !strings.Contains(msg, "tmux session gate-inbox-board") || !strings.Contains(msg, "keychain") {
-		t.Fatal(msg, err)
-	}
-	if last := far.calls[len(far.calls)-1]; !strings.Contains(last, "new-session") || !strings.Contains(last, "/home/me/go/bin/gate-inbox") {
-		t.Fatal(last)
-	}
-}
-
-func bufioReader(s string) *bufio.Reader { return bufio.NewReader(strings.NewReader(s)) }
 
 // screenUI is the board's UI as the machines screen sees it.
 type screenUI struct {
@@ -696,13 +590,13 @@ func TestMachinesScreen(t *testing.T) {
 	}
 	waitFor(t, "suggestions", func() bool { return strings.Contains(text(v.Render(120, 40)), "devbox") })
 	body := text(v.Render(120, 40))
-	if !strings.Contains(body, "› mini  online · 2 sessions · 1 not mirrored  mini · config.toml") {
+	if !strings.Contains(body, "› mini  online · 2 sessions · 1 not mirrored  mini") {
 		t.Fatal(body)
 	}
 	if strings.Count(body, "mini") != 2 {
 		t.Fatal("a machine on the board is offered again:\n" + body)
 	}
-	if !strings.Contains(body, "devbox  not checked") {
+	if !strings.Contains(body, "devbox  from ~/.ssh/config · enter to check and add") {
 		t.Fatal(body)
 	}
 	// Space pauses mini, off the event loop; the screen reads the store
@@ -722,11 +616,60 @@ func TestMachinesScreen(t *testing.T) {
 	v.Closed(extension.CloseReplaced)
 }
 
+func TestMachinesScreenStartsOnRenderAndCancelsLoadOnClose(t *testing.T) {
+	e := newManaged(t, healthyFar(), mini)
+	u := &screenUI{}
+	e.ui = u
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	e.run = func(ctx context.Context, argv []string) ([]byte, error) {
+		if slices.Contains(argv, "-G") && argv[len(argv)-1] == "mini" {
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+		}
+		return nil, ctx.Err()
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	e.openMachines(t.Context())
+	_, view := u.last()
+	v := view.(*machinesView)
+	listeners := func() int {
+		e.status.mu.Lock()
+		defer e.status.mu.Unlock()
+		return len(e.status.listeners)
+	}
+	if listeners() != 0 {
+		t.Fatal("registered a listener before the board rendered the view")
+	}
+	v.Render(120, 40)
+	v.Render(120, 40)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the screen did not start loading")
+	}
+	if listeners() != 1 {
+		t.Fatal("expected one listener after render")
+	}
+
+	v.Closed(extension.CloseDismissed)
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closing the screen did not cancel its SSH config lookup")
+	}
+	if listeners() != 0 {
+		t.Fatal("closing the screen left a listener registered")
+	}
+}
+
 func TestMachinesScreenRemovesOnTheSecondPress(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	far := healthyFar()
 	e := newManaged(t, far)
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box"}, &bytes.Buffer{}, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box"}, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	u := &screenUI{}
@@ -745,84 +688,34 @@ func TestMachinesScreenRemovesOnTheSecondPress(t *testing.T) {
 	}
 }
 
-func TestAddFormAddsOrOpensASetupRow(t *testing.T) {
+func TestAddFormShowsTheSSHCommandAndCanRetry(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	far := healthyFar()
-	far.sshErr = errors.New("exit status 255: Permission denied (publickey).")
+	far.sshErr = errors.New("Permission denied (publickey).")
 	e := newManaged(t, far)
-	b := newFakeBoard()
-	e.board = b
 	u := &screenUI{}
 	e.ui = u
 	e.openAdd(context.Background(), "")
 	_, view := u.last()
 	f := view.(*addForm)
-	values := map[string]string{"destination": "me@box", "name": "", "group": ""}
+	values := map[string]string{"destination": "me@box", "name": "box", "group": "work", "home": "~/board", "gate_inbox": "/opt/bin/gate-inbox"}
 	f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: values})
-	waitFor(t, "the key problem", func() bool { return strings.Contains(text(f.Render(120, 40)), "ctrl+f") })
-	// Launching waits on the board, so the key returns at once and the
-	// form closes itself once the row is there.
-	if f.Key(extension.ViewKey{Action: actionFix, Key: "ctrl+f", Values: values}) {
-		t.Fatal("the key waited for the launch")
-	}
-	waitFor(t, "the setup row", func() bool { u.mu.Lock(); defer u.mu.Unlock(); return u.closed == 1 })
-	launches := b.launched()
-	if len(launches) != 1 {
-		t.Fatal(launches)
-	}
-	req := launches[0]
-	if req.Role != setupRoleName || req.Tool != toolName || strings.Join(req.Args, " ") != "--add -- me@box" || req.Name != "add-box" {
-		t.Fatalf("%+v", req)
-	}
-	if !slices.Contains(b.pins, "l1=waiting") {
-		t.Fatal(b.pins)
-	}
-	// The form handed the operator a row; closing it left them there.
+	waitFor(t, "the SSH command", func() bool {
+		return strings.Contains(text(f.Render(120, 40)), "`ssh-copy-id me@box`")
+	})
 	if screen, _ := u.last(); screen != addScreen {
-		t.Fatal("reopened the machines screen over the setup row")
+		t.Fatal(screen)
 	}
 
 	far.setErr(nil)
-	e.openAdd(context.Background(), "")
-	_, view = u.last()
-	f = view.(*addForm)
 	f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: values})
-	waitFor(t, "the add", func() bool {
-		u.mu.Lock()
-		defer u.mu.Unlock()
-		return len(u.notes) > 1
-	})
-	if u.notes[len(u.notes)-1] != "Added box-1 (me@box)" {
-		t.Fatal(u.notes)
-	}
 	waitFor(t, "the machines screen", func() bool { s, _ := u.last(); return s == machinesScreen })
-}
-
-// A setup row's pane runs `machines add` through the mirror tool's
-// command, `machines attach`.
-func TestAttachRunsASetupPane(t *testing.T) {
-	far := healthyFar()
-	e := newManaged(t, far)
-	stdin := os.Stdin
-	r, w, _ := os.Pipe()
-	os.Stdin = r
-	t.Cleanup(func() { os.Stdin = stdin })
-	w.WriteString("\n")
-	w.Close()
-	stdout := os.Stdout
-	devnull, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	os.Stdout = devnull
-	t.Setenv("GATE_INBOX_SESSION_ID", "abcd")
-	err := e.runAttach(context.Background(), []string{"", setupFlag, "--name", "box", "--", "me@box"}, nil)
-	os.Stdout = stdout
-	if err != nil {
-		t.Fatal(err)
+	h, ok := e.machines().host("box")
+	if !ok || h.Group != "work" || h.Home != "~/board" || h.GateInbox != "/opt/bin/gate-inbox" {
+		t.Fatal(h)
 	}
-	if h, ok := e.machines().host("box"); !ok || h.Destination != "me@box" {
-		t.Fatal(e.machines().all())
-	}
-	if !setupDone(e.machines().dir, "abcd") {
-		t.Fatal("the pane did not mark its row done")
+	if !slices.Equal(u.notes, []string{"Added box (me@box)"}) {
+		t.Fatal(u.notes)
 	}
 }
 
@@ -838,45 +731,6 @@ func TestWrapLinesBreaksLongNotesAtSpaces(t *testing.T) {
 	}
 	if lines[2][0].Tone != extension.ToneBad {
 		t.Fatal("a wrapped line lost its tone")
-	}
-}
-
-func TestPreviewSaysWhyAStoppedBoardsMirrorHasNone(t *testing.T) {
-	var routes previewRoutes
-	obs := seen(mini, live("a1", "waiting"))
-	obs.Snapshot.BoardRunning = boolPtr(false)
-	routes.update(withMirrors("mini/a1", "l1"), []observation{obs})
-	if _, ok := routes.lookup("l1"); ok {
-		t.Fatal("a stopped board's mirror has a preview route")
-	}
-	if err := routes.unavailable("l1"); err == nil || err.Error() != "no preview until mini's board is running" {
-		t.Fatal(err)
-	}
-	if err := routes.unavailable("l9"); err == nil || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatal(err)
-	}
-}
-
-// A setup pane's command ends on a shell, so the row still reads as
-// running; the pane marks itself done and the next pass archives it.
-func TestPassArchivesASetupRowThatMarkedItselfDone(t *testing.T) {
-	dir := t.TempDir()
-	b := newFakeBoard()
-	b.sessions["ab12"] = extension.SessionInfo{ID: "ab12", Tool: toolName, Role: setupRole, Running: true}
-	m := newMirrors(config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}, b, nil, quiet(), hosts{}.run, dir)
-	m.pass(context.Background())
-	if len(b.archives) != 0 {
-		t.Fatal("archived a setup row still in use")
-	}
-	if err := markSetupDone(dir, "ab12"); err != nil {
-		t.Fatal(err)
-	}
-	m.pass(context.Background())
-	if !slices.Contains(b.archives, "ab12") || setupDone(dir, "ab12") {
-		t.Fatal(b.archives)
-	}
-	if markSetupDone(dir, "../x") == nil {
-		t.Fatal("a path that is not a session id was written")
 	}
 }
 
@@ -916,7 +770,7 @@ func TestNWithNoMachinesOpensTheMachinesScreen(t *testing.T) {
 	if screen, _ := u.last(); screen != machinesScreen {
 		t.Fatal(screen)
 	}
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &bytes.Buffer{}, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	keys[0].Run(context.Background(), extension.Press{})
@@ -944,8 +798,7 @@ func TestSSHTargetReadsWhatSSHWouldConnectTo(t *testing.T) {
 	}
 }
 
-// An alias in ~/.ssh/config for a machine already on the board is not
-// offered again, nor is a discovered machine that reports its hostname.
+// Suggestions match existing machines by their SSH targets without polling.
 func TestSuggestionsLeaveOutMachinesAlreadyOnTheBoard(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -964,12 +817,9 @@ func TestSuggestionsLeaveOutMachinesAlreadyOnTheBoard(t *testing.T) {
 	e.reg.learn("mini", "mini.example.com", about{Hostname: "hung-mini"})
 	e.cfg.Discover = []string{"sh", "-c", "printf '10.0.0.7\\n'"}
 	found, problem := e.suggestions(context.Background())
-	var got []string
-	for _, s := range found {
-		got = append(got, s.Destination)
-	}
-	if problem != "" || strings.Join(got, ",") != "devbox" {
-		t.Fatal(got, problem)
+	want := []suggestion{{Destination: "10.0.0.7", From: fromDiscover}, {Destination: "devbox", From: fromSSHConfig}}
+	if problem != "" || !slices.Equal(found, want) || len(far.calls) != 0 {
+		t.Fatal(found, problem, far.calls)
 	}
 }
 
@@ -982,7 +832,7 @@ func TestAddRefusesAnotherNameForAMachineOnTheBoard(t *testing.T) {
 	mini := host{Name: "mini", Destination: "mini.example.com", GateInbox: "gate-inbox", Tmux: "tmux"}
 	e := newManaged(t, far, mini)
 	var out bytes.Buffer
-	_, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias"}, &out, nil)
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias"}, &out)
 	if err == nil || !strings.Contains(err.Error(), "reaches the same host as mini (me@mini.example.com:22)") {
 		t.Fatal(err)
 	}
@@ -990,7 +840,7 @@ func TestAddRefusesAnotherNameForAMachineOnTheBoard(t *testing.T) {
 		t.Fatal("probed a machine it was going to refuse:", out.String())
 	}
 	// The same host with a board home of its own is a second board.
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias", Home: "~/other-board"}, &out, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias", Home: "~/other-board"}, &out); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1005,7 +855,7 @@ func TestAddWithNoHomeMeansTheBoardAlreadyThere(t *testing.T) {
 	}
 	mini := host{Name: "mini", Destination: "mini.example.com", GateInbox: "gate-inbox", Tmux: "tmux", Home: "~/review/board"}
 	e := newManaged(t, far, mini)
-	_, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias"}, &bytes.Buffer{}, nil)
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias"}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "with board home ~/review/board; for another board on that host, give its board home") {
 		t.Fatal(err)
 	}
@@ -1016,14 +866,14 @@ func TestAddRefusesAMachineThatReportsAHostnameOnTheBoard(t *testing.T) {
 	far := healthyFar()
 	e := newManaged(t, far)
 	var out bytes.Buffer
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box.example.com"}, &out, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box.example.com"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	_, err := e.addMachine(context.Background(), addOptions{Destination: "10.0.0.7"}, &out, nil)
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "10.0.0.7"}, &out)
 	if err == nil || !strings.Contains(err.Error(), "same machine as box-1: both report hostname Box-1.local") {
 		t.Fatal(err)
 	}
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "10.0.0.7", Force: true}, &out, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "10.0.0.7", Force: true}, &out); err != nil {
 		t.Fatal("--force did not add it:", err)
 	}
 }
@@ -1035,122 +885,25 @@ func TestAddTakesAGateInboxPath(t *testing.T) {
 	far.snap.About.GateInbox = far.loginPath
 	e := newManaged(t, far)
 	var out bytes.Buffer
-	_, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "x"}, &out, nil)
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "x"}, &out)
 	if err != nil {
 		t.Fatal("the login shell should still find it:", err)
 	}
 	// Neither PATH nor the login shell knows a binary under another name.
 	far.loginPath = ""
 	out.Reset()
-	_, err = e.addMachine(context.Background(), addOptions{Destination: "box2"}, &out, nil)
+	_, err = e.addMachine(context.Background(), addOptions{Destination: "box2"}, &out)
 	if err == nil || !strings.Contains(out.String(), "give this build's full path there as the gate-inbox path (--gate-inbox)") {
 		t.Fatal(err, out.String())
 	}
 	far.loginPath = "/srv/review/bin/gate-inbox-machines"
 	far.snap.About.Hostname = "box2.local"
-	h, err := e.addMachine(context.Background(), addOptions{Destination: "box2", Name: "y", GateInbox: far.loginPath}, &out, nil)
+	h, err := e.addMachine(context.Background(), addOptions{Destination: "box2", Name: "y", GateInbox: far.loginPath}, &out)
 	if err != nil || h.Settings.GateInbox != far.loginPath {
 		t.Fatal(err, h)
 	}
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box3", GateInbox: "bin/gate-inbox"}, &out, nil); err == nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box3", GateInbox: "bin/gate-inbox"}, &out); err == nil {
 		t.Fatal("a relative path was taken")
-	}
-}
-
-func TestAddFormPassesPathAndHomeToItsSetupRow(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	far := healthyFar()
-	far.sshErr = errors.New("exit status 255: Permission denied (publickey).")
-	e := newManaged(t, far)
-	b := newFakeBoard()
-	e.board = b
-	u := &screenUI{}
-	e.ui = u
-	e.openAdd(context.Background(), "")
-	_, view := u.last()
-	f := view.(*addForm)
-	var ids []string
-	for _, field := range f.Fields() {
-		ids = append(ids, field.ID)
-	}
-	if strings.Join(ids, ",") != "destination,name,group,gate_inbox,home" {
-		t.Fatal(ids)
-	}
-	values := map[string]string{"destination": "box", "name": "", "group": "", "gate_inbox": "~/review/bin/gate-inbox-machines", "home": "~/review/board"}
-	f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: values})
-	waitFor(t, "the key problem", func() bool { return strings.Contains(text(f.Render(120, 40)), "ctrl+f") })
-	f.Key(extension.ViewKey{Action: actionFix, Key: "ctrl+f", Values: values})
-	waitFor(t, "the setup row", func() bool { return len(b.launched()) == 1 })
-	if args := strings.Join(b.launched()[0].Args, " "); args != "--add --home ~/review/board --gate-inbox ~/review/bin/gate-inbox-machines -- box" {
-		t.Fatal(args)
-	}
-}
-
-func (b *fakeBoard) launched() []extension.LaunchRequest {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return slices.Clone(b.launches)
-}
-
-// A machine on the board whose check fails on its key gets f, which opens
-// a setup row that fixes it rather than adding it again.
-func TestMachinesScreenOffersAFixPaneAfterACheck(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	far := healthyFar()
-	e := newManaged(t, far, mini)
-	b := newFakeBoard()
-	e.board = b
-	u := &screenUI{}
-	e.ui = u
-	far.setErr(errors.New("exit status 255: Permission denied (publickey)."))
-	e.openMachines(context.Background())
-	_, view := u.last()
-	v := view.(*machinesView)
-	v.Key(extension.ViewKey{Action: actionCheck, Key: "c"})
-	waitFor(t, "the check", func() bool { return strings.Contains(text(v.Render(120, 40)), "Press f to fix it") })
-	v.Key(extension.ViewKey{Action: actionFix, Key: "f"})
-	waitFor(t, "the fix row", func() bool { return len(b.launched()) == 1 })
-	req := b.launched()[0]
-	if req.Role != setupRoleName || req.Name != "fix-mini" || strings.Join(req.Args, " ") != "--add --fix -- mini" {
-		t.Fatalf("%+v", req)
-	}
-	waitFor(t, "the screen to close", func() bool { u.mu.Lock(); defer u.mu.Unlock(); return u.closed == 1 })
-}
-
-// The fix pane checks the machine, runs the fix once the operator agrees,
-// and checks again, without adding anything.
-func TestFixPaneFixesAMachineOnTheBoard(t *testing.T) {
-	far := healthyFar()
-	far.setErr(errors.New("exit status 255: Permission denied (publickey)."))
-	e := newManaged(t, far, mini)
-	var ran []string
-	e.attach = func(_ context.Context, argv []string) (int, error) {
-		ran = argv
-		far.setErr(nil)
-		return 0, nil
-	}
-	stdin, stdout := os.Stdin, os.Stdout
-	in, feed, _ := os.Pipe()
-	out, err := os.CreateTemp(t.TempDir(), "pane")
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdin, os.Stdout = in, out
-	t.Cleanup(func() { os.Stdin, os.Stdout = stdin, stdout })
-	feed.WriteString("y\n\n")
-	feed.Close()
-	t.Setenv("GATE_INBOX_SESSION_ID", "abcd")
-	err = e.runAttach(context.Background(), []string{"", setupFlag, fixFlag, "--", "mini"}, nil)
-	os.Stdin, os.Stdout = stdin, stdout
-	if err != nil {
-		t.Fatal(err)
-	}
-	pane, _ := os.ReadFile(out.Name())
-	if strings.Join(ran, " ") != "ssh-copy-id mini" || !strings.Contains(string(pane), "Every check passed.") {
-		t.Fatalf("%v\n%s", ran, pane)
-	}
-	if len(e.machines().all()) != 1 || !setupDone(e.machines().dir, "abcd") {
-		t.Fatal(e.machines().all())
 	}
 }
 
@@ -1158,18 +911,18 @@ func TestAddTheSameDestinationWithAnotherHomeIsASecondBoard(t *testing.T) {
 	far := healthyFar()
 	e := newManaged(t, far)
 	var out bytes.Buffer
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box", Home: "~/one"}, &out, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box", Home: "~/one"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	_, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out, nil)
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out)
 	if err == nil || !strings.Contains(err.Error(), "already on this board as box with board home ~/one") {
 		t.Fatal(err)
 	}
 	far.snap.About.Hostname = "other-board.local"
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box2", Home: "~/two"}, &out, nil); err != nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box2", Home: "~/two"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Home: "~/two"}, &out, nil); err == nil {
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Home: "~/two"}, &out); err == nil {
 		t.Fatal("the same board was added twice")
 	}
 }
@@ -1206,7 +959,7 @@ func TestMachineStatusShowsTheVersion(t *testing.T) {
 // file's lock.
 func TestRegistryReadsDontWaitOnTheFileLock(t *testing.T) {
 	dir := t.TempDir()
-	r := newRegistry(nil, dir)
+	r := newRegistry(dir)
 	lock, err := os.OpenFile(filepath.Join(dir, lockFileName), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)

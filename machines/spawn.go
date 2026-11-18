@@ -61,7 +61,7 @@ func (e *Extension) machineUI() extension.UI {
 			}},
 		{Screen: spawnScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "close"},
 	}
-	return extension.UI{Preview: &extension.PreviewSource{Role: roleName, Read: e.readPreview}, Keys: append(keys, machinesKeys()...)}
+	return extension.UI{Keys: append(keys, machinesKeys()...)}
 }
 
 // openSpawn shows the new-session form, on machine when one is named.

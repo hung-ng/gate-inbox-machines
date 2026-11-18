@@ -152,10 +152,10 @@ func (h host) withAbout(a about) host {
 	if h.Settings.GateInbox == "" && a.GateInbox != "" {
 		h.GateInbox = a.GateInbox
 	}
-	if h.Settings.Tmux == "" && a.Tmux != "" {
+	if a.Tmux != "" {
 		h.Tmux = a.Tmux
 	}
-	if h.Settings.TmuxSocket == "" && a.TmuxSocket != nil {
+	if a.TmuxSocket != nil {
 		h.TmuxSocket = *a.TmuxSocket
 	}
 	return h

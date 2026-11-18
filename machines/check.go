@@ -54,44 +54,24 @@ func (e *Extension) runCheck(ctx context.Context, names []string, out io.Writer)
 		}
 	}
 	if failed {
-		return errors.New("machine setup checks failed")
+		return errors.New("machine checks failed")
 	}
 	return nil
 }
 
 // sshHint is the fix for an ssh that could not run a command at all.
-func sshHint(err error) string {
-	switch sshProblem(err) {
-	case fixKey:
-		return "install your SSH key on that machine"
-	case fixHostKey:
-		return "ssh in once by hand to accept its host key"
-	}
+func sshHint(err error, destination string) string {
 	msg := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(msg, "permission denied"):
+		return fmt.Sprintf("run `ssh-copy-id %s` in a terminal (T opens one on the board), then try again", shellWord(destination))
+	case strings.Contains(msg, "host key verification failed"):
+		return fmt.Sprintf("run `ssh %s true` once in a terminal to accept its host key", shellWord(destination))
 	case strings.Contains(msg, "resolve"), strings.Contains(msg, "timed out"), strings.Contains(msg, "timeout"), strings.Contains(msg, "refused"):
 		return "check the network, and that the machine accepts SSH logins (on a Mac, Remote Login in System Settings > General > Sharing; on Linux, the sshd service)"
 	default:
 		return "check the network and SSH configuration"
 	}
-}
-
-// A setup problem `machines add` can fix at a terminal.
-const (
-	fixKey     = "key"
-	fixHostKey = "host key"
-)
-
-// sshProblem is the fix an ssh failure needs typed at a terminal, if any.
-func sshProblem(err error) string {
-	msg := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(msg, "permission denied"):
-		return fixKey
-	case strings.Contains(msg, "host key verification failed"):
-		return fixHostKey
-	}
-	return ""
 }
 
 // exitCoder is what an *exec.ExitError offers; asking for the interface
@@ -119,8 +99,6 @@ type checkStep struct {
 	Soft bool
 	// Warn is reported but fails nothing.
 	Warn bool
-	// Fixable is the terminal fix a failed ssh step needs, if any.
-	Fixable string
 }
 
 // probeResult is one machine walked through the board's needs.
@@ -221,17 +199,14 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 		return e.run(ctx, sshArgv(e.cfg, false, h.Destination, machineCommand(h, program, args...)))
 	}
 	if _, err := run("true"); err != nil {
-		step(checkStep{Name: "ssh", Err: err, Fix: sshHint(err), Fixable: sshProblem(err)})
+		step(checkStep{Name: "ssh", Err: err, Fix: sshHint(err, h.Destination)})
 		return result
 	}
 	step(checkStep{Name: "ssh"})
 	if _, err := run(h.GateInbox, "--version"); err != nil {
 		fix := "check that gate-inbox runs on that machine"
 		if notFound(err) {
-			fix = "set gate_inbox to its full path"
-			if h.Source == sourceAdded {
-				fix = "remove it and add it again with --gate-inbox, giving this build's full path there"
-			}
+			fix = "remove it and add it again with --gate-inbox, giving this build's full path there"
 			if h.Settings.GateInbox == "" {
 				// An installer often puts it on a PATH only the login
 				// files set.
@@ -256,7 +231,7 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 	}
 	step(checkStep{Name: "machines command"})
 	if _, err := run(h.Tmux, "-V"); err != nil {
-		step(checkStep{Name: "tmux", Err: err, Fix: "install tmux there, or set tmux to its full path"})
+		step(checkStep{Name: "tmux", Err: err, Fix: "install tmux there and make it available on PATH"})
 		return result
 	}
 	step(checkStep{Name: "tmux"})
@@ -287,7 +262,7 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 	}
 	step(checkStep{Name: "board running"})
 	// A board whose sessions none of them can be attached to is most often
-	// one on its own tmux server that this machine's config doesn't name.
+	// one on a tmux server the reply did not report.
 	if len(snap.Sessions) > 0 {
 		for _, s := range snap.Sessions {
 			if s.Attachable {
@@ -295,7 +270,7 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 				return result
 			}
 		}
-		fix := "set tmux_socket to match that board's config"
+		fix := "check tmux_socket in that board's config.toml"
 		if h.About != nil && h.About.TmuxSocket != nil {
 			// The machine said which server its board uses, and it was
 			// asked about that one.

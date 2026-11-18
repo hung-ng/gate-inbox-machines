@@ -21,23 +21,22 @@ func TestCheckFailures(t *testing.T) {
 		step             int
 		msg, reply, want string
 	}{
-		{0, "Permission denied", "", "install your SSH key"},
-		{0, "Host key verification failed", "", "ssh in once by hand"},
+		{0, "Permission denied", "", "ssh-copy-id mini"},
+		{0, "Host key verification failed", "", "ssh mini true"},
 		{0, "Could not resolve hostname", "", "accepts SSH logins"},
 		{0, "Connection timed out", "", "accepts SSH logins"},
 		{0, "Connection refused", "", "accepts SSH logins"},
-		{1, "exit 127", "", "set gate_inbox to its full path"},
+		{1, "exit 127", "", "add it again with --gate-inbox"},
 		{1, "connect to 127.0.0.1 failed", "", "check that gate-inbox runs"},
 		{2, "unknown command machines", "", "install this build there"},
-		{3, "not found", "", "set tmux to its full path"},
+		{3, "not found", "", "make it available on PATH"},
 		{4, "", "garbage", "sessions reply FAIL"},
 		{4, "", `{"version":2}`, "same build on both"},
 		{5, "", `{"version":1,"board_running":false}`, "start that machine's board"},
-		{6, "", `{"version":1,"sessions":[{"id":"a1"}]}`, "set tmux_socket"},
+		{6, "", `{"version":1,"sessions":[{"id":"a1"}]}`, "check tmux_socket"},
 	} {
 		t.Run(tc.want+tc.msg, func(t *testing.T) {
-			e := New()
-			e.cfg = config{SSH: []string{"ssh"}, ControlPath: "none", Hosts: []host{mini}}
+			e := newManaged(t, healthyFar(), mini)
 			calls := 0
 			e.run = func(_ context.Context, a []string) ([]byte, error) {
 				step := calls
@@ -65,8 +64,7 @@ func TestCheckFailures(t *testing.T) {
 }
 
 func TestCheckHealthyAndNamed(t *testing.T) {
-	e := New()
-	e.cfg = config{SSH: []string{"ssh"}, ControlPath: "none", Hosts: []host{mini, {Name: "box", Destination: "box"}}}
+	e := newManaged(t, healthyFar(), mini, box)
 	e.run = func(_ context.Context, a []string) ([]byte, error) {
 		if strings.Contains(strings.Join(a, " "), "-- box") {
 			t.Fatal(a)
@@ -83,7 +81,7 @@ func TestCheckHealthyAndNamed(t *testing.T) {
 	if e.runCheck(context.Background(), []string{"missing"}, &out) == nil {
 		t.Fatal("unknown machine accepted")
 	}
-	e.cfg.Hosts = nil
+	e.reg = newRegistry("")
 	if err := e.runCheck(context.Background(), nil, &out); err == nil || !strings.Contains(err.Error(), "no machines configured") {
 		t.Fatal("no machines accepted:", err)
 	}

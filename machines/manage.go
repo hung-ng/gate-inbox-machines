@@ -1,14 +1,12 @@
 package machines
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -31,36 +29,6 @@ type addOptions struct {
 	Force bool
 }
 
-// terminal is the operator at a terminal, for the fixes that need one
-// there: a password for ssh-copy-id, a host key to accept. Nil is no
-// terminal, as on the machines screen, which opens a setup row instead.
-type terminal struct {
-	in  *bufio.Reader
-	out io.Writer
-	// run runs a command on this terminal and returns its exit code.
-	run attachRunner
-}
-
-func (t *terminal) ask(question string) bool {
-	fmt.Fprintf(t.out, "%s [Y/n] ", question)
-	line, err := t.in.ReadString('\n')
-	if err != nil && line == "" {
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "" || answer == "y" || answer == "yes"
-}
-
-// errNeedsTerminal is an add that stopped at a step only a terminal can fix.
-type errNeedsTerminal struct {
-	Fix  string
-	Step checkStep
-}
-
-func (e errNeedsTerminal) Error() string {
-	return fmt.Sprintf("%s: %v; %s", e.Step.Name, e.Step.Err, e.Step.Fix)
-}
-
 // validDestination refuses a destination ssh would read as something else.
 func validDestination(d string) error {
 	switch {
@@ -76,9 +44,8 @@ func validDestination(d string) error {
 
 // addMachine checks a machine by its destination and saves it, under the
 // name given or one made from its hostname. Each step it ran is written to
-// out. With a terminal it offers the ssh fixes that need one, then checks
-// again; without one it stops at them with errNeedsTerminal.
-func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writer, term *terminal) (host, error) {
+// out.
+func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writer) (host, error) {
 	opts.Destination = strings.TrimSpace(opts.Destination)
 	opts.Name = strings.TrimSpace(opts.Name)
 	if err := validDestination(opts.Destination); err != nil {
@@ -124,26 +91,8 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 	if err := ensureControlDir(e.cfg.ControlPath); err != nil {
 		return host{}, err
 	}
-	var result probeResult
-	for tries := 0; ; tries++ {
-		result = forAdding(e.probe(ctx, probeHost))
-		result.print(out, opts.Destination)
-		blocked := result.blocking()
-		// A host key is checked before the login, so a machine can need
-		// both fixes, one after the other.
-		if blocked == nil || blocked.Fixable == "" || tries == 2 {
-			break
-		}
-		if term == nil {
-			if !opts.Force {
-				return host{}, errNeedsTerminal{Fix: blocked.Fixable, Step: *blocked}
-			}
-			break
-		}
-		if !e.fixAtTerminal(ctx, term, opts.Destination, blocked.Fixable) {
-			break
-		}
-	}
+	result := forAdding(e.probe(ctx, probeHost))
+	result.print(out, opts.Destination)
 	if blocked := result.blocking(); blocked != nil && !opts.Force {
 		return host{}, fmt.Errorf("%s was not added: %s failed; fix that and add it again, or pass --force to add it anyway", opts.Destination, blocked.Name)
 	}
@@ -167,12 +116,7 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 		}
 		name = suggestName(hostname, opts.Destination, taken)
 	}
-	err = reg.change(func(store *storeFile, base []host) error {
-		for _, h := range base {
-			if h.Name == name {
-				return fmt.Errorf("config.toml already has a machine named %s", name)
-			}
-		}
+	err = reg.change(func(store *storeFile) error {
 		if _, ok := store.Machines[name]; ok {
 			return fmt.Errorf("a machine named %s is already on this board", name)
 		}
@@ -212,8 +156,7 @@ func otherBoardHint(h host) string {
 	return ""
 }
 
-// forAdding rewords the fixes that name a config key in terms of what an
-// add takes: the add form's fields, or the add command's flags.
+// forAdding gives fixes in terms of the add form fields and flags.
 func forAdding(result probeResult) probeResult {
 	for i, step := range result.Steps {
 		if step.Err == nil {
@@ -231,41 +174,6 @@ func forAdding(result probeResult) probeResult {
 	return result
 }
 
-// fixAtTerminal runs the fix a failed ssh step needs, on the operator's
-// terminal, once they agree to it. It says whether it ran.
-func (e *Extension) fixAtTerminal(ctx context.Context, term *terminal, destination, fix string) bool {
-	var argv []string
-	switch fix {
-	case fixKey:
-		if !term.ask("Copy your SSH key to " + destination + " with ssh-copy-id? You type that machine's password once.") {
-			return false
-		}
-		// ssh-copy-id runs its own ssh, so options set in the ssh setting
-		// do not reach it; a destination from ~/.ssh/config does.
-		argv = []string{"ssh-copy-id", destination}
-	case fixHostKey:
-		if !term.ask("Connect to " + destination + " once to see its host key and accept it?") {
-			return false
-		}
-		argv = append(slices.Clone(e.cfg.SSH), "-o", "BatchMode=no", "-o", "ControlPath=none", "--", destination, "true")
-	default:
-		return false
-	}
-	fmt.Fprintf(term.out, "$ %s\n", strings.Join(argv, " "))
-	code, err := term.run(ctx, argv)
-	if err != nil {
-		fmt.Fprintf(term.out, "could not run %s: %v\n", argv[0], err)
-		return false
-	}
-	if code != 0 {
-		fmt.Fprintf(term.out, "%s exited %d\n", argv[0], code)
-	}
-	return true
-}
-
-// addFlags declares the flags `machines add` and a setup row's pane take,
-// and returns what reads them back. setupArgs is the other half: the
-// machines screen hands a setup row its options through these flags.
 func addFlags(set *flag.FlagSet) func(destination string) addOptions {
 	name := set.String("name", "", "the machine's name on this board; defaults to its hostname")
 	group := set.String("group", "", "an existing group to file its rows under")
@@ -277,19 +185,6 @@ func addFlags(set *flag.FlagSet) func(destination string) addOptions {
 	}
 }
 
-// setupArgs is opts as the flags addFlags reads, for a setup row's pane.
-func setupArgs(opts addOptions) []string {
-	var args []string
-	for _, flag := range []struct{ name, value string }{
-		{"--name", opts.Name}, {"--group", opts.Group}, {"--home", opts.Home}, {"--gate-inbox", opts.GateInbox},
-	} {
-		if flag.value != "" {
-			args = append(args, flag.name, flag.value)
-		}
-	}
-	return append(args, "--", strings.TrimSpace(opts.Destination))
-}
-
 func (e *Extension) runAdd(ctx context.Context, args []string) error {
 	set := cmdline.NewFlagSet(usageAdd)
 	options := addFlags(set)
@@ -297,143 +192,12 @@ func (e *Extension) runAdd(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	var term *terminal
-	if isTerminal(os.Stdin) {
-		term = &terminal{in: bufio.NewReader(os.Stdin), out: os.Stdout, run: e.attach}
-	}
-	h, err := e.addMachine(ctx, options(operands[0]), os.Stdout, term)
+	h, err := e.addMachine(ctx, options(operands[0]), os.Stdout)
 	if err != nil {
-		var needs errNeedsTerminal
-		if errors.As(err, &needs) {
-			return fmt.Errorf("%w; run this at a terminal to fix it there", err)
-		}
 		return err
 	}
 	fmt.Printf("Added %s (%s). A running board shows its sessions within a few seconds.\n", h.Name, h.Destination)
 	return nil
-}
-
-// setupFlag leads a setup row's arguments to `machines attach`, which is
-// what the mirror tool block runs. fixFlag after it makes the row fix a
-// machine already on the board rather than add one.
-const (
-	setupFlag = "--add"
-	fixFlag   = "--fix"
-)
-
-const (
-	setupRoleName = "setup"
-	setupRole     = extensionID + "/" + setupRoleName
-)
-
-// runSetupPane runs in a setup row's pane, which the machines screen opens
-// for a machine whose ssh setup needs the operator to type: `machines add`
-// for a new one, or a check with its fix for one already on the board. It
-// waits for Enter before it ends, so the result stays on screen.
-func (e *Extension) runSetupPane(ctx context.Context, args []string, caller string) error {
-	in := bufio.NewReader(os.Stdin)
-	term := &terminal{in: in, out: os.Stdout, run: e.attach}
-	if len(args) > 0 && args[0] == fixFlag {
-		set := cmdline.NewFlagSet(usageCheck)
-		operands, err := cmdline.Parse(os.Stdout, program, set, args[1:], 1, 1)
-		if err != nil {
-			return err
-		}
-		e.fixMachine(ctx, operands[0], term)
-	} else {
-		set := cmdline.NewFlagSet(usageAdd)
-		options := addFlags(set)
-		operands, err := cmdline.Parse(os.Stdout, program, set, args, 1, 1)
-		if err != nil {
-			return err
-		}
-		opts := options(operands[0])
-		fmt.Printf("Adding %s to this board.\n\n", opts.Destination)
-		h, err := e.addMachine(ctx, opts, os.Stdout, term)
-		if err != nil {
-			fmt.Printf("\n%v\n", err)
-		} else {
-			fmt.Printf("\nAdded %s (%s). Its sessions show on the board within a few seconds.\n", h.Name, h.Destination)
-		}
-	}
-	fmt.Print("\nPress Enter to close this row.")
-	_, _ = in.ReadString('\n')
-	// A pane whose command ends is left on a shell, so the row would read
-	// as running for good. The marker tells the board to archive it.
-	if caller != "" && e.machines().dir != "" {
-		if err := markSetupDone(e.machines().dir, caller); err != nil {
-			fmt.Printf("could not mark this row done (%v); archive it with x\n", err)
-		}
-	}
-	return nil
-}
-
-// fixMachine checks a machine already on the board at the operator's
-// terminal, runs the fix a failed ssh step needs once they agree, and
-// checks again.
-func (e *Extension) fixMachine(ctx context.Context, name string, term *terminal) {
-	reg := e.machines()
-	h, ok := reg.host(name)
-	if !ok {
-		fmt.Fprintf(term.out, "no machine %q on this board\n", name)
-		return
-	}
-	if err := ensureControlDir(e.cfg.ControlPath); err != nil {
-		fmt.Fprintln(term.out, err)
-		return
-	}
-	fmt.Fprintf(term.out, "Checking %s (%s).\n\n", h.Name, h.Destination)
-	var result probeResult
-	for tries := 0; ; tries++ {
-		result = e.probe(ctx, h)
-		result.print(term.out, h.Name)
-		blocked := result.blocking()
-		if blocked == nil || blocked.Fixable == "" || tries == 2 || !e.fixAtTerminal(ctx, term, h.Destination, blocked.Fixable) {
-			break
-		}
-	}
-	if result.Snapshot != nil && result.Snapshot.About != nil {
-		_, _ = reg.learn(h.Name, h.Destination, *result.Snapshot.About)
-	}
-	if result.failed() {
-		fmt.Fprintf(term.out, "\n%s still fails a check; the step above says what to change.\n", h.Name)
-		return
-	}
-	fmt.Fprintf(term.out, "\nEvery check passed. The board picks %s up on its next poll.\n", h.Name)
-}
-
-// setupDoneDir holds a file for each setup row whose pane has finished.
-const setupDoneDir = "setup-done"
-
-func markSetupDone(dataDir, id string) error {
-	if !sessionIDPattern.MatchString(id) {
-		return fmt.Errorf("%q is not a session id", id)
-	}
-	dir := filepath.Join(dataDir, setupDoneDir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, id), nil, 0o600)
-}
-
-// setupDone says whether a setup row's pane has marked itself finished.
-func setupDone(dataDir, id string) bool {
-	if dataDir == "" || !sessionIDPattern.MatchString(id) {
-		return false
-	}
-	_, err := os.Stat(filepath.Join(dataDir, setupDoneDir, id))
-	return err == nil
-}
-
-func clearSetupDone(dataDir, id string) {
-	if dataDir != "" && sessionIDPattern.MatchString(id) {
-		_ = os.Remove(filepath.Join(dataDir, setupDoneDir, id))
-	}
-}
-
-func isTerminal(f *os.File) bool {
-	info, err := f.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 func (e *Extension) runRemove(args []string) error {
@@ -450,10 +214,7 @@ func (e *Extension) runRemove(args []string) error {
 }
 
 func (e *Extension) removeMachine(name string) error {
-	return e.machines().change(func(store *storeFile, base []host) error {
-		if inConfig(base, name) {
-			return fmt.Errorf("%s is written in config.toml; delete its [extensions.machines.%s] table there, or pause it", name, name)
-		}
+	return e.machines().change(func(store *storeFile) error {
 		if _, ok := store.Machines[name]; !ok {
 			return fmt.Errorf("no machine %q", name)
 		}
@@ -461,61 +222,6 @@ func (e *Extension) removeMachine(name string) error {
 		store.Paused = slices.DeleteFunc(store.Paused, func(n string) bool { return n == name })
 		return nil
 	})
-}
-
-func inConfig(base []host, name string) bool {
-	return slices.ContainsFunc(base, func(h host) bool { return h.Name == name })
-}
-
-func (e *Extension) runRename(args []string) error {
-	set := cmdline.NewFlagSet(usageRename)
-	operands, err := cmdline.Parse(os.Stdout, program, set, args, 2, 2)
-	if err != nil {
-		return err
-	}
-	if err := e.renameMachine(operands[0], operands[1]); err != nil {
-		return err
-	}
-	fmt.Printf("Renamed %s to %s. A running board brings its mirrors back under the new name.\n", operands[0], operands[1])
-	return nil
-}
-
-// renameMachine renames an added machine. Mirrors are keyed by their
-// machine's name, so a running board puts the old ones away and starts
-// them again under the new name.
-func (e *Extension) renameMachine(from, to string) error {
-	if err := checkName(to); err != nil {
-		return err
-	}
-	reg := e.machines()
-	old, _ := reg.host(from)
-	err := reg.change(func(store *storeFile, base []host) error {
-		if inConfig(base, from) {
-			return fmt.Errorf("%s is written in config.toml; rename its table there", from)
-		}
-		s, ok := store.Machines[from]
-		if !ok {
-			return fmt.Errorf("no machine %q", from)
-		}
-		if _, taken := store.Machines[to]; taken || inConfig(base, to) {
-			return fmt.Errorf("a machine named %s is already on this board", to)
-		}
-		delete(store.Machines, from)
-		store.Machines[to] = s
-		for i, n := range store.Paused {
-			if n == from {
-				store.Paused[i] = to
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if old.About != nil {
-		_, _ = reg.learn(to, old.Destination, *old.About)
-	}
-	return nil
 }
 
 func (e *Extension) runPause(args []string, pause bool) error {
@@ -540,8 +246,8 @@ func (e *Extension) runPause(args []string, pause bool) error {
 }
 
 func (e *Extension) pauseMachine(name string, pause bool) error {
-	return e.machines().change(func(store *storeFile, base []host) error {
-		if _, ok := store.Machines[name]; !ok && !inConfig(base, name) {
+	return e.machines().change(func(store *storeFile) error {
+		if _, ok := store.Machines[name]; !ok {
 			return fmt.Errorf("no machine %q", name)
 		}
 		store.Paused = slices.DeleteFunc(store.Paused, func(n string) bool { return n == name })
@@ -556,7 +262,6 @@ func (e *Extension) pauseMachine(name string, pause bool) error {
 type listedMachine struct {
 	Name        string `json:"name"`
 	Destination string `json:"destination"`
-	Source      string `json:"source"`
 	Paused      bool   `json:"paused,omitempty"`
 	Group       string `json:"group,omitempty"`
 	About       *about `json:"about,omitempty"`
@@ -571,7 +276,7 @@ func (e *Extension) runList(args []string) error {
 	reg := e.machines()
 	listed := []listedMachine{}
 	for _, h := range reg.all() {
-		listed = append(listed, listedMachine{Name: h.Name, Destination: h.Destination, Source: h.Source, Paused: h.Paused, Group: h.Group, About: h.About})
+		listed = append(listed, listedMachine{Name: h.Name, Destination: h.Destination, Paused: h.Paused, Group: h.Group, About: h.About})
 	}
 	text := "no machines: add one with `gate-inbox machines add <destination>`"
 	if len(listed) > 0 {
@@ -586,7 +291,7 @@ func (e *Extension) runList(args []string) error {
 			if m.About != nil {
 				about = describeAbout(*m.About)
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", m.Name, m.Destination, m.Source, state, about)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", m.Name, m.Destination, state, about)
 		}
 		w.Flush()
 		text = strings.TrimRight(b.String(), "\n")

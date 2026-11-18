@@ -3,13 +3,11 @@
 //
 // Each machine runs its own board, as it does today: that board reads its
 // panes, holds its questions and types its messages. This extension asks
-// each configured machine's board for its sessions over ssh, and gives
+// each added machine's board for its sessions over ssh, and gives
 // every one a row here: a session of the extension's own whose pane runs
 // `ssh -t <machine> tmux attach -t gi_<id>`, with its status pinned to the
-// one that machine's board reports. The board then does the rest with what
-// it already has: the row sorts into triage, its preview is the other
-// machine's conversation and current dialog, and focusing it types into
-// the agent there.
+// one that machine's board reports. The row sorts into triage, and
+// focusing it opens the remote terminal.
 //
 // Nothing listens on a port. Everything goes over ssh with the operator's
 // own key, so this extension can reach on a machine exactly what the
@@ -59,18 +57,17 @@ skip_rename_directive = true
 
 // Extension is the machines extension. The zero value is not ready; use New.
 type Extension struct {
-	cfg      config
-	conf     extension.Config
-	reg      *registry
-	ui       extension.UIHost
-	boardMu  sync.Mutex
-	board    boardOps
-	run      runner
-	attach   attachRunner
-	wake     chan string
-	tools    toolCache
-	previews previewRoutes
-	status   statusBoard
+	cfg     config
+	conf    extension.Config
+	reg     *registry
+	ui      extension.UIHost
+	boardMu sync.Mutex
+	board   boardOps
+	run     runner
+	attach  attachRunner
+	wake    chan string
+	tools   toolCache
+	status  statusBoard
 }
 
 // New returns the extension, to list in app.Options.Extensions.
@@ -87,8 +84,21 @@ func (e *Extension) Descriptor() extension.Descriptor {
 // another machine's board reads this one: the same build runs on every
 // machine.
 func (e *Extension) Configure(c extension.Config) error {
-	s, err := decodeSettings(c)
-	if err != nil {
+	var s settings
+	if err := c.Decode(&s); err != nil {
+		// Decode fills this map even when it reports unknown keys inside
+		// a table. Read it only to identify old machine tables.
+		var section map[string]any
+		_ = c.Decode(&section)
+		for _, name := range sortedKeys(section) {
+			if table, ok := section[name].(map[string]any); ok {
+				destination, _ := table["destination"].(string)
+				if destination == "" {
+					destination = name
+				}
+				return fmt.Errorf("delete the [extensions.machines.%s] table, then add the machine with `gate-inbox machines add %s`", name, shellWord(destination))
+			}
+		}
 		return err
 	}
 	cfg, err := resolve(s)
@@ -96,40 +106,26 @@ func (e *Extension) Configure(c extension.Config) error {
 		return err
 	}
 	e.cfg, e.conf = cfg, c
-	// A host with no data dir still gets config.toml's machines; it just
-	// has nowhere to keep added ones.
 	dir, _ := c.DataDir()
-	e.reg = newRegistry(cfg.Hosts, dir)
+	e.reg = newRegistry(dir)
 	return nil
 }
 
-// machines is every machine this build knows: config.toml's, the ones
-// added from the board or the CLI, and what each said about itself.
+// machines reads the registry for this extension.
 func (e *Extension) machines() *registry {
 	if e.reg != nil {
 		return e.reg
 	}
 	// Built without Configure, as in a test that set cfg itself.
-	return newRegistry(e.cfg.Hosts, "")
+	return newRegistry("")
 }
 
 // Roles makes a mirror a row of its own rather than somebody's helper: it
 // is kept in view and queued like a top-level session, its status is the
 // one pinned from its machine, and nothing it does is relayed to anyone.
-//
-// A setup row is a pane the machines screen opens to finish adding a
-// machine that needs the operator at a prompt: a password for
-// ssh-copy-id, or a host key to accept. Its status is pinned to waiting,
-// so triage hands it over, and it is archived once its pane ends.
 func (e *Extension) Roles() []extension.RoleSpec {
 	return []extension.RoleSpec{{
 		Name:             roleName,
-		OnScreen:         true,
-		Silent:           true,
-		SkipSendChildren: true,
-		PinnedStatus:     true,
-	}, {
-		Name:             setupRoleName,
 		OnScreen:         true,
 		Silent:           true,
 		SkipSendChildren: true,
@@ -160,7 +156,6 @@ func (e *Extension) StartBoard(ctx context.Context, board extension.BoardHost) (
 	m.reg = e.machines()
 	m.wake = e.wake
 	m.tools = &e.tools
-	m.previews = &e.previews
 	m.status = &e.status
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -172,23 +167,22 @@ func (e *Extension) StartBoard(ctx context.Context, board extension.BoardHost) (
 }
 
 const (
-	usageSessions   = "machines sessions [--tmux <path>] [--tmux-socket <name>] [--json]"
-	usageAttach     = "machines attach <machine> <session-id>"
-	usageCheck      = "machines check [<machine>...]"
-	usagePreview    = "machines preview <session-id>"
-	usageAdd        = "machines add [--name <name>] [--group <group>] [--home <dir>] [--gate-inbox <path>] [--force] <destination>"
-	usageRemove     = "machines remove <machine>"
-	usageRename     = "machines rename <machine> <new-name>"
-	usagePause      = "machines pause <machine>"
-	usageResume     = "machines resume <machine>"
-	usageList       = "machines list [--json]"
-	usageStartBoard = "machines start-board <machine>"
+	usageSessions = "machines sessions [--tmux <path>] [--tmux-socket <name>] [--json]"
+	usageAttach   = "machines attach <machine> <session-id>"
+	usageCheck    = "machines check [<machine>...]"
+
+	usageAdd    = "machines add [--name <name>] [--group <group>] [--home <dir>] [--gate-inbox <path>] [--force] <destination>"
+	usageRemove = "machines remove <machine>"
+
+	usagePause  = "machines pause <machine>"
+	usageResume = "machines resume <machine>"
+	usageList   = "machines list [--json]"
 )
 
 func (e *Extension) Commands() []extension.Command {
 	return []extension.Command{{
 		Name:  "machines",
-		Usage: "machines <add|list|remove|rename|pause|resume|check|start-board|sessions|attach|preview>",
+		Usage: "machines <add|list|remove|pause|resume|check|sessions|attach>",
 		About: "add and manage the other machines whose agents this board shows, and answer their boards",
 		Run:   e.runMachines,
 	}}
@@ -213,18 +207,13 @@ func (e *Extension) runMachines(ctx context.Context, args []string, host extensi
 		},
 		{
 			Name: "add", Usage: usageAdd,
-			About: "check a machine by its ssh destination and add it, offering to fix its ssh setup at a terminal",
+			About: "check a machine by its ssh destination and add it",
 			Run:   func(args []string) error { return e.runAdd(ctx, args) },
 		},
 		{
 			Name: "remove", Usage: usageRemove,
 			About: "remove a machine added with add; its mirrors are put away",
 			Run:   func(args []string) error { return e.runRemove(args) },
-		},
-		{
-			Name: "rename", Usage: usageRename,
-			About: "rename a machine added with add; its mirrors come back under the new name",
-			Run:   func(args []string) error { return e.runRename(args) },
 		},
 		{
 			Name: "pause", Usage: usagePause,
@@ -238,25 +227,8 @@ func (e *Extension) runMachines(ctx context.Context, args []string, host extensi
 		},
 		{
 			Name: "list", Usage: usageList,
-			About: "list every machine, where it was written, and what it last said about itself",
+			About: "list every machine and what it last said about itself",
 			Run:   func(args []string) error { return e.runList(args) },
-		},
-		{
-			Name: "start-board", Usage: usageStartBoard,
-			About: "start a machine's board in a detached tmux session there, through your login shell",
-			Run:   func(args []string) error { return e.runStartBoard(ctx, args) },
-		},
-		{
-			Name: "preview", Usage: usagePreview,
-			About: "read a session's conversation and live dialog for a mirror",
-			Run: func(args []string) error {
-				set := cmdline.NewFlagSet(usagePreview)
-				operands, err := cmdline.Parse(os.Stdout, program, set, args, 1, 1)
-				if err != nil {
-					return err
-				}
-				return writePreview(ctx, operands[0], host, os.Stdout)
-			},
 		},
 	}, args)
 }
@@ -309,15 +281,6 @@ func (e *Extension) runAttach(ctx context.Context, args []string, host extension
 	// The board launches the tool with its prompt ahead of these arguments,
 	// and a mirror has none, so an empty word may lead them.
 	args = slices.DeleteFunc(slices.Clone(args), func(a string) bool { return a == "" })
-	if len(args) > 0 && args[0] == setupFlag {
-		// A setup row's pane: `machines add` at a terminal, for a machine
-		// that needs a password or a host key typed.
-		caller := os.Getenv("GATE_INBOX_SESSION_ID")
-		if host != nil && host.Caller() != "" {
-			caller = host.Caller()
-		}
-		return e.runSetupPane(ctx, args[1:], caller)
-	}
 	if len(args) == 0 {
 		// The machines tool is in the new-session picker like any other,
 		// and picking it starts this with nothing to attach to.

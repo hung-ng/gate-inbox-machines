@@ -147,10 +147,10 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	dir := t.TempDir()
 	grouped := mini
 	grouped.Group = "mini group"
-	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none", Hosts: []host{grouped}}
+	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
 	board, ui := newFakeBoard(), &fakeUI{badges: map[string]string{}, facts: map[string]string{}}
 	reply := hosts{"mini": snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{live("a1", "waiting")}}}
-	m := newMirrors(cfg, board, ui, quiet(), reply.run, dir)
+	m := newMirrors(cfg, board, ui, quiet(), reply.run, machineStore(t, dir, grouped))
 
 	m.pass(context.Background())
 	if len(board.launches) != 1 {
@@ -215,10 +215,10 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 // Killing a mirror is how the operator reconnects it: the next pass
 // replaces it in its own place and follows the new row.
 func TestPassReconnectsAKilledMirrorInPlace(t *testing.T) {
-	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none", Hosts: []host{mini}}
+	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
 	board := newFakeBoard()
 	reply := hosts{"mini": snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{live("a1", "waiting")}}}
-	m := newMirrors(cfg, board, nil, quiet(), reply.run, t.TempDir())
+	m := newMirrors(cfg, board, nil, quiet(), reply.run, machineStore(t, t.TempDir(), mini))
 	m.pass(context.Background())
 	board.mu.Lock()
 	killed := board.sessions["l1"]
@@ -242,11 +242,11 @@ func TestPassReconnectsAKilledMirrorInPlace(t *testing.T) {
 }
 
 func TestPassBacksOffALaunchTheBoardRefuses(t *testing.T) {
-	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none", Hosts: []host{mini}}
+	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
 	board := newFakeBoard()
 	board.launchErr = errors.New("no tool machines")
 	reply := hosts{"mini": snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{live("a1", "idle")}}}
-	m := newMirrors(cfg, board, nil, quiet(), reply.run, t.TempDir())
+	m := newMirrors(cfg, board, nil, quiet(), reply.run, machineStore(t, t.TempDir(), mini))
 	m.pass(context.Background())
 	board.launchErr = nil
 	m.pass(context.Background())

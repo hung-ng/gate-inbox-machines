@@ -16,11 +16,11 @@ import (
 )
 
 func TestUnavailablePinsAndOwnsWithoutReconcile(t *testing.T) {
-	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none", Hosts: []host{mini}}
+	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
 	b := newFakeBoard()
 	u := &fakeUI{badges: map[string]string{}, facts: map[string]string{}}
 	replies := hosts{"mini": snapshot{Version: wireVersion, BoardRunning: boolPtr(true), Sessions: []machineSession{live("a1", "waiting")}}}
-	m := newMirrors(cfg, b, u, quiet(), replies.run, t.TempDir())
+	m := newMirrors(cfg, b, u, quiet(), replies.run, machineStore(t, t.TempDir(), mini))
 	m.now = func() time.Time { return time.Date(2026, 1, 1, 12, 34, 0, 0, time.UTC) }
 	m.pass(context.Background())
 	for _, offline := range []bool{true, false} {
@@ -56,7 +56,7 @@ func TestLegacyMirrorReplacedWithMirrorTool(t *testing.T) {
 	b := newFakeBoard()
 	b.sessions["old"] = extension.SessionInfo{ID: "old", Tool: "machines", Role: mirrorRole, Running: true}
 	replies := hosts{"mini": snapshot{Version: wireVersion, BoardRunning: boolPtr(true), Sessions: []machineSession{live("a1", "waiting")}}}
-	m := newMirrors(config{Hosts: []host{mini}, SSH: []string{"ssh"}, Poll: defaultPoll, ControlPath: "none"}, b, nil, quiet(), replies.run, t.TempDir())
+	m := newMirrors(config{SSH: []string{"ssh"}, Poll: defaultPoll, ControlPath: "none"}, b, nil, quiet(), replies.run, machineStore(t, t.TempDir(), mini))
 	m.state = withMirrors("mini/a1", "old")
 	m.pass(context.Background())
 	if b.sessions[m.state.Mirrors["mini/a1"]].Tool != "mirror" {
@@ -121,7 +121,7 @@ func TestSpawnArgvAndForm(t *testing.T) {
 		t.Fatal("interactive spawn")
 	}
 	e := New()
-	e.cfg.Hosts = []host{mini, box}
+	e.reg = newRegistry(machineStore(t, t.TempDir(), mini, box))
 	f := &spawnForm{e: e, names: []string{"mini", "box"}, known: map[string][]string{"mini": {"agent"}}}
 	if len(f.Fields()) != 1 {
 		t.Fatal(f.Fields())
@@ -160,7 +160,8 @@ func (u *spawnUI) Open(screen string, v extension.View) extension.ViewHandle {
 func TestFormOpensSpawnsNotifiesAndWakesPoll(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		e := New()
-		e.cfg = config{Hosts: []host{mini}, SSH: []string{"ssh"}, ControlPath: "none"}
+		e.cfg = config{SSH: []string{"ssh"}, ControlPath: "none"}
+		e.reg = newRegistry(machineStore(t, t.TempDir(), mini))
 		u := &spawnUI{notifications: make(chan string, 1)}
 		e.ui = u
 		e.tools.set("mini", []string{"agent"})
@@ -285,9 +286,9 @@ func TestBoardSingletonPID(t *testing.T) {
 
 func TestCachedToolsSurviveFailureAndAreCopied(t *testing.T) {
 	e := New()
-	e.cfg = config{Hosts: []host{mini}, Poll: defaultPoll, SSH: []string{"ssh"}}
+	e.cfg = config{Poll: defaultPoll, SSH: []string{"ssh"}}
 	replies := hosts{"mini": snapshot{Version: wireVersion, Tools: []string{"agent"}}}
-	m := newMirrors(e.cfg, newFakeBoard(), nil, quiet(), replies.run, t.TempDir())
+	m := newMirrors(e.cfg, newFakeBoard(), nil, quiet(), replies.run, machineStore(t, t.TempDir(), mini))
 	m.tools = &e.tools
 	m.observe(context.Background(), m.reg.active())
 	replies["mini"] = context.DeadlineExceeded
@@ -344,7 +345,7 @@ func TestOwnershipTrackingClearedOnArchiveAndReplace(t *testing.T) {
 	b := newFakeBoard()
 	u := &fakeUI{badges: map[string]string{}, facts: map[string]string{}}
 	replies := hosts{"mini": snapshot{Version: wireVersion, Sessions: []machineSession{live("a1", "working")}}}
-	m := newMirrors(config{Hosts: []host{mini}, Poll: defaultPoll, SSH: []string{"ssh"}}, b, u, quiet(), replies.run, t.TempDir())
+	m := newMirrors(config{Poll: defaultPoll, SSH: []string{"ssh"}}, b, u, quiet(), replies.run, machineStore(t, t.TempDir(), mini))
 	m.pass(context.Background())
 	first := m.state.Mirrors["mini/a1"]
 	if _, ok := m.owned[first]; !ok {

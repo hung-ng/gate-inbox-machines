@@ -12,19 +12,9 @@ import (
 	"time"
 )
 
-// Where a machine was written.
-const (
-	sourceConfig = "config.toml"
-	sourceAdded  = "added here"
-)
-
 // The extension's files in its data dir, beside the mirrors' state.
 const (
-	// storeFileName is the machines added with `machines add` or the
-	// machines screen, and the ones paused. config.toml is the operator's
-	// own file, which the board never rewrites, so what is changed from
-	// the board lives here, the way the board keeps its own Settings out
-	// of config.toml.
+	// storeFileName holds the machines on this board and their pauses.
 	storeFileName = "machines.json"
 	// learnedFileName is what each machine last said about itself, so a
 	// mirror's pane and the CLI attach and poll the way the board does.
@@ -37,7 +27,7 @@ const (
 // storeFile is machines.json.
 type storeFile struct {
 	Machines map[string]hostSettings `json:"machines,omitempty"`
-	// Paused names machines, from either source, that are not polled.
+	// Paused names machines that are not polled.
 	Paused []string `json:"paused,omitempty"`
 }
 
@@ -50,11 +40,9 @@ type learnedEntry struct {
 	At          time.Time `json:"at"`
 }
 
-// registry is every machine this board shows: config.toml's tables, the
-// ones added from the board or the CLI, and what each last said about
-// itself. The board's poll loop, its key handlers and every CLI command
-// read it, so it is safe for concurrent use, and it reads its files again
-// when they change on disk.
+// registry reads the board's machines and what they last reported about
+// themselves. The poll loop and key handlers share it, and it reads files
+// again when they change on disk.
 type registry struct {
 	// io serializes this process's reads and writes of the files, and
 	// guards stamps. It is never held while mu is wanted by a caller that
@@ -65,7 +53,6 @@ type registry struct {
 	stamps map[string]fileStamp
 
 	mu      sync.Mutex
-	base    []host
 	dir     string
 	store   storeFile
 	learned map[string]learnedEntry
@@ -75,11 +62,8 @@ type registry struct {
 	problem string
 }
 
-// newRegistry is the machines from config.toml (base, resolved), plus the
-// files in dir. An empty dir is a registry with nowhere to save, which is
-// what a test or a host without a data dir gets.
-func newRegistry(base []host, dir string) *registry {
-	r := &registry{base: base, dir: dir, stamps: map[string]fileStamp{}, learned: map[string]learnedEntry{}}
+func newRegistry(dir string) *registry {
+	r := &registry{dir: dir, stamps: map[string]fileStamp{}, learned: map[string]learnedEntry{}}
 	r.reload()
 	r.mu.Lock()
 	r.buildLocked()
@@ -200,25 +184,13 @@ func (r *registry) buildLocked() {
 	for _, name := range r.store.Paused {
 		paused[name] = true
 	}
-	taken := map[string]bool{}
 	var hosts []host
-	for _, h := range r.base {
-		taken[h.Name] = true
-		hosts = append(hosts, h)
-	}
 	for _, name := range sortedKeys(r.store.Machines) {
-		if taken[name] {
-			// config.toml is the operator's own file, so it wins; the
-			// commands refuse to add a name it has, and this is only
-			// reached when the table was written after.
-			continue
-		}
 		h, err := resolveHost(name, r.store.Machines[name])
 		if err != nil {
 			r.problem = fmt.Sprintf("%s in %s: %v", name, storeFileName, err)
 			continue
 		}
-		h.Source = sourceAdded
 		hosts = append(hosts, h)
 	}
 	for i, h := range hosts {
@@ -228,15 +200,6 @@ func (r *registry) buildLocked() {
 		}
 		hosts[i] = h
 	}
-	slices.SortFunc(hosts, func(a, b host) int {
-		switch {
-		case a.Name < b.Name:
-			return -1
-		case a.Name > b.Name:
-			return 1
-		}
-		return 0
-	})
 	r.hosts = hosts
 }
 
@@ -298,9 +261,8 @@ func cleanLearned(learned map[string]learnedEntry) map[string]learnedEntry {
 var errNoStore = errors.New("this build has no data directory to keep added machines in")
 
 // change applies edit to machines.json as it is on disk now, under the
-// lock, and saves it. config.toml's machines are passed for edit to check
-// names and destinations against.
-func (r *registry) change(edit func(store *storeFile, base []host) error) error {
+// lock, and saves it.
+func (r *registry) change(edit func(store *storeFile) error) error {
 	if r.dir == "" {
 		return errNoStore
 	}
@@ -313,7 +275,7 @@ func (r *registry) change(edit func(store *storeFile, base []host) error) error 
 		if store.Machines == nil {
 			store.Machines = map[string]hostSettings{}
 		}
-		if err := edit(&store, r.base); err != nil {
+		if err := edit(&store); err != nil {
 			return err
 		}
 		slices.Sort(store.Paused)

@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -17,16 +16,6 @@ type suggestion struct {
 	Destination string
 	// From is where it came from: ~/.ssh/config, or the discover command.
 	From string
-	// Status is what a probe found, or "" for one not probed. Hosts from
-	// ~/.ssh/config are not probed until picked: that file also names
-	// servers that have nothing to do with this board, and nothing should
-	// connect to them unasked. The discover command lists what the
-	// operator chose to list, so its entries are probed when the screen
-	// opens.
-	Status string
-	Ready  bool
-	// Hostname is what a probed machine reported about itself.
-	Hostname string
 }
 
 const (
@@ -174,7 +163,7 @@ type discoverError struct {
 func (e *discoverError) Error() string { return e.err.Error() + ": " + e.msg }
 
 // suggestions is every machine the screen can offer that is not on the
-// board already: the discover command's, probed, then ~/.ssh/config's.
+// board already, from the discover command and ~/.ssh/config.
 // It is slow, so the screen calls it off the board's loop.
 func (e *Extension) suggestions(ctx context.Context) ([]suggestion, string) {
 	machines := e.machines().all()
@@ -219,18 +208,9 @@ func (e *Extension) suggestions(ctx context.Context) ([]suggestion, string) {
 	if err != nil {
 		problem = "the discover command failed: " + err.Error()
 	}
-	var probed []suggestion
 	for _, d := range discovered {
 		if fresh(d) {
-			probed = append(probed, suggestion{Destination: d, From: fromDiscover})
-		}
-	}
-	e.probeSuggestions(ctx, probed)
-	// A probed machine that reports the hostname of one on the board is
-	// that machine by another address, such as its LAN one.
-	for _, s := range probed {
-		if s.Hostname == "" || !hostnames[shortHostname(s.Hostname)] {
-			out = append(out, s)
+			out = append(out, suggestion{Destination: d, From: fromDiscover})
 		}
 	}
 	if home, err := os.UserHomeDir(); err == nil {
@@ -291,55 +271,4 @@ func targetHost(target string) string {
 		rest = rest[:i]
 	}
 	return rest
-}
-
-// probeSuggestions asks each machine for its sessions, a few at a time,
-// over a connection of its own that closes after, and says in a few words
-// what it found.
-func (e *Extension) probeSuggestions(ctx context.Context, list []suggestion) {
-	cfg := e.cfg
-	cfg.ControlPath = "none"
-	limit := make(chan struct{}, 8)
-	var wg sync.WaitGroup
-	for i := range list {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			limit <- struct{}{}
-			defer func() { <-limit }()
-			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			h, err := resolveHost("new", hostSettings{Destination: list[i].Destination})
-			if err != nil {
-				list[i].Status = err.Error()
-				return
-			}
-			snap, err := pollHost(ctx, e.run, cfg, h)
-			list[i].Status, list[i].Ready = probeSummary(snap, err)
-			if err == nil && snap.About != nil {
-				list[i].Hostname = snap.About.Hostname
-			}
-		}()
-	}
-	wg.Wait()
-}
-
-// probeSummary is a probe's result in a few words.
-func probeSummary(snap snapshot, err error) (string, bool) {
-	switch {
-	case err == nil && snap.boardRunning():
-		return "ready, board running", true
-	case err == nil:
-		return "ready, board stopped", true
-	case notFound(err):
-		return "no gate-inbox found there", false
-	case sshProblem(err) == fixKey:
-		return "needs your SSH key", false
-	case sshProblem(err) == fixHostKey:
-		return "host key not accepted yet", false
-	case strings.Contains(err.Error(), "not a session list"):
-		return "runs a gate-inbox without this extension", false
-	default:
-		return "can't connect", false
-	}
 }

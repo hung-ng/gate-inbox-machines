@@ -3,11 +3,9 @@ package machines
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/usestring/gate-inbox/extension"
 )
@@ -16,7 +14,6 @@ import (
 const (
 	machinesScreen = "machines"
 	addScreen      = "machine_add"
-	renameScreen   = "machine_rename"
 )
 
 // Actions on the machines screen.
@@ -25,10 +22,7 @@ const (
 	actionCheck      = "check"
 	actionPause      = "pause"
 	actionRemove     = "remove"
-	actionStartBoard = "start_board"
 	actionNewSession = "new_session"
-	actionRename     = "rename"
-	actionFix        = "fix_in_pane"
 )
 
 func machinesKeys() []extension.KeyBinding {
@@ -37,26 +31,18 @@ func machinesKeys() []extension.KeyBinding {
 		{Screen: machinesScreen, Action: actionCheck, Keys: []string{"c"}, Label: "check the machine"},
 		{Screen: machinesScreen, Action: actionPause, Keys: []string{"space"}, Label: "pause or resume"},
 		{Screen: machinesScreen, Action: actionRemove, Keys: []string{"d"}, Label: "remove (press twice)"},
-		{Screen: machinesScreen, Action: actionStartBoard, Keys: []string{"s"}, Label: "start its board"},
 		{Screen: machinesScreen, Action: actionNewSession, Keys: []string{"n"}, Label: "new session there"},
-		{Screen: machinesScreen, Action: actionRename, Keys: []string{"r"}, Label: "rename"},
-		{Screen: machinesScreen, Action: actionFix, Keys: []string{"f"}, Label: "fix it in a pane"},
 		{Screen: machinesScreen, Action: extension.ActionClose, Keys: []string{"esc", "q"}, Label: "close"},
-		{Screen: addScreen, Action: actionFix, Keys: []string{"ctrl+f"}, Label: "fix it in a pane"},
 		{Screen: addScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "back"},
-		{Screen: renameScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "back"},
 	}
 }
 
 // openMachines shows the machines screen.
 func (e *Extension) openMachines(ctx context.Context) {
 	v := &machinesView{e: e, ctx: ctx, loading: true}
+	v.mu.Lock()
 	v.handle = e.ui.Open(machinesScreen, v)
-	if v.handle == nil {
-		return
-	}
-	v.stop = e.status.listen(v.handle.Refresh)
-	go v.load()
+	v.mu.Unlock()
 }
 
 // machinesView is the machines screen: every machine with its state, and
@@ -75,17 +61,16 @@ type machinesView struct {
 	note        []extension.Line
 	confirm     string
 	busy        bool
-	// fixable is the machine whose last check failed on a step a setup
-	// row can fix, the one f opens a pane for.
-	fixable string
 }
 
-func (v *machinesView) load() {
-	found, problem := v.e.suggestions(v.ctx)
+func (v *machinesView) load(ctx context.Context) {
+	found, problem := v.e.suggestions(ctx)
 	v.mu.Lock()
 	v.suggestions, v.problem, v.loading = found, problem, false
 	v.mu.Unlock()
-	v.handle.Refresh()
+	if ctx.Err() == nil {
+		v.handle.Refresh()
+	}
 }
 
 func (v *machinesView) Title() string { return "Machines" }
@@ -110,6 +95,16 @@ func (v *machinesView) rowsLocked() []row {
 func (v *machinesView) Render(width, height int) []extension.Line {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	// The board may decline Open without calling Closed.
+	if v.stop == nil && v.handle != nil {
+		ctx, cancel := context.WithCancel(v.ctx)
+		unlisten := v.e.status.listen(v.handle.Refresh)
+		v.stop = func() {
+			cancel()
+			unlisten()
+		}
+		go v.load(ctx)
+	}
 	rows := v.rowsLocked()
 	v.cursor = min(v.cursor, max(len(rows)-1, 0))
 	var lines []extension.Line
@@ -131,7 +126,7 @@ func (v *machinesView) Render(width, height int) []extension.Line {
 			{Text: marker(i == v.cursor), Tone: extension.ToneAccent},
 			{Text: pad(h.Name, nameWidth) + "  ", Bold: true},
 			{Text: status, Tone: tone},
-			{Text: "  " + h.Destination + " · " + h.Source},
+			{Text: "  " + h.Destination},
 		})
 	}
 	lines = append(lines, extension.Line{}, extension.Line{{Text: "Suggestions", Bold: true}})
@@ -146,18 +141,10 @@ func (v *machinesView) Render(width, height int) []extension.Line {
 		if index == v.cursor {
 			cursorLine = len(lines)
 		}
-		status, tone := "not checked; press a to check and add it", extension.ToneMuted
-		if s.Status != "" {
-			status, tone = s.Status, extension.ToneWarn
-			if s.Ready {
-				tone = extension.ToneGood
-			}
-		}
 		lines = append(lines, extension.Line{
 			{Text: marker(index == v.cursor), Tone: extension.ToneAccent},
 			{Text: s.Destination + "  ", Bold: true},
-			{Text: status, Tone: tone},
-			{Text: "  from " + s.From},
+			{Text: "from " + s.From + " · enter to check and add", Tone: extension.ToneMuted},
 		})
 	}
 	var tail []extension.Line
@@ -315,15 +302,7 @@ func (v *machinesView) Key(k extension.ViewKey) bool {
 				if result.Snapshot != nil && result.Snapshot.About != nil {
 					_, _ = v.e.machines().learn(h.Name, h.Destination, *result.Snapshot.About)
 				}
-				lines := textLines(out.String(), result.failed())
-				v.mu.Lock()
-				v.fixable = ""
-				if blocked := result.blocking(); blocked != nil && blocked.Fixable != "" {
-					v.fixable = h.Name
-					lines = append(lines, extension.Line{{Text: "Press f to fix it in a pane on this board, where you can type what it asks.", Tone: extension.ToneWarn}})
-				}
-				v.mu.Unlock()
-				return lines
+				return textLines(out.String(), result.failed())
 			})
 		}
 	case actionPause:
@@ -357,49 +336,11 @@ func (v *machinesView) Key(k extension.ViewKey) bool {
 				})
 			}
 		}
-	case actionStartBoard:
-		if current.machine != nil {
-			h := *current.machine
-			v.run("starting "+h.Name+"'s board...", func() []extension.Line {
-				msg, err := v.e.startBoard(v.ctx, h)
-				v.e.wakeLoop(h.Name)
-				if err != nil {
-					return []extension.Line{{{Text: err.Error(), Tone: extension.ToneBad}}}
-				}
-				return []extension.Line{{{Text: msg + ".", Tone: extension.ToneGood}}}
-			})
-		}
 	case actionNewSession:
 		if current.machine != nil && !current.machine.Paused {
 			v.e.openSpawn(v.ctx, current.machine.Name)
 		}
-	case actionFix:
-		v.mu.Lock()
-		name := v.fixable
-		v.mu.Unlock()
-		if current.machine == nil || current.machine.Name != name {
-			break
-		}
-		v.run("opening a pane to fix "+name+"...", func() []extension.Line {
-			row, err := v.e.openSetupRow(v.ctx, "fix-"+name, []string{setupFlag, fixFlag, "--", name})
-			if err != nil {
-				return outcome(err, "")
-			}
-			v.mu.Lock()
-			v.fixable = ""
-			v.mu.Unlock()
-			v.e.ui.Notify("Opened " + row + ". Open it from the list to fix " + name + ".")
-			v.handle.Close()
-			return nil
-		})
-	case actionRename:
-		if current.machine != nil {
-			if current.machine.Source != sourceAdded {
-				v.say(errors.New(current.machine.Name+" is written in config.toml; rename its table there"), "")
-			} else {
-				v.e.openRename(v.ctx, current.machine.Name)
-			}
-		}
+
 	}
 	v.handle.Refresh()
 	return false
@@ -426,12 +367,6 @@ func (v *machinesView) run(doing string, work func() []extension.Line) {
 	}()
 }
 
-func (v *machinesView) say(err error, done string) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.note = outcome(err, done)
-}
-
 // outcome is an action's result as a note: its error, or what it did.
 func outcome(err error, done string) []extension.Line {
 	if err != nil {
@@ -441,6 +376,8 @@ func outcome(err error, done string) []extension.Line {
 }
 
 func (v *machinesView) Closed(extension.CloseReason) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if v.stop != nil {
 		v.stop()
 	}
@@ -487,13 +424,9 @@ type addForm struct {
 	handle      extension.ViewHandle
 	destination string
 
-	mu      sync.Mutex
-	lines   []extension.Line
-	busy    bool
-	pending *addOptions
-	// leave is set once the form opened a setup row, so closing it does
-	// not put the machines screen back over the row the operator wants.
-	leave bool
+	mu    sync.Mutex
+	lines []extension.Line
+	busy  bool
 }
 
 func (f *addForm) Title() string { return "Add a machine" }
@@ -527,63 +460,25 @@ func (f *addForm) Key(k extension.ViewKey) bool {
 			f.mu.Unlock()
 			return false
 		}
-		f.busy, f.pending = true, nil
+		f.busy = true
 		f.lines = []extension.Line{{{Text: "Checking " + strings.TrimSpace(opts.Destination) + "..."}}}
 		f.mu.Unlock()
 		go f.add(opts)
-	case actionFix:
-		f.mu.Lock()
-		pending := f.pending
-		f.mu.Unlock()
-		if pending == nil {
-			return false
-		}
-		f.mu.Lock()
-		f.pending = nil
-		f.mu.Unlock()
-		opts := *pending
-		// Launching a row waits on the board, so it runs off the event
-		// loop and closes the form once the row is there.
-		go func() {
-			row, err := f.e.openSetupRow(f.ctx, "add-"+suggestName("", opts.Destination, func(string) bool { return false }), append([]string{setupFlag}, setupArgs(opts)...))
-			if err != nil {
-				f.mu.Lock()
-				f.pending = &opts
-				f.mu.Unlock()
-				f.setLines(append(f.snapshotLines(), extension.Line{{Text: err.Error(), Tone: extension.ToneBad}}))
-				return
-			}
-			f.e.ui.Notify("Opened " + row + ". Open it from the list to finish adding " + opts.Destination + ".")
-			f.mu.Lock()
-			f.leave = true
-			f.mu.Unlock()
-			f.handle.Close()
-		}()
+
 	}
 	return false
 }
 
 func (f *addForm) add(opts addOptions) {
 	var out bytes.Buffer
-	h, err := f.e.addMachine(f.ctx, opts, &out, nil)
+	h, err := f.e.addMachine(f.ctx, opts, &out)
 	lines := textLines(out.String(), true)
 	f.mu.Lock()
 	f.busy = false
 	f.mu.Unlock()
-	var needs errNeedsTerminal
-	switch {
-	case errors.As(err, &needs):
-		what := "your SSH key needs installing there, which takes that machine's password"
-		if needs.Fix == fixHostKey {
-			what = "its host key needs accepting"
-		}
-		lines = append(lines, extension.Line{{Text: "To finish, " + what + ". Press ctrl+f to do it in a pane on this board.", Tone: extension.ToneWarn}})
-		f.mu.Lock()
-		f.pending = &opts
-		f.mu.Unlock()
-	case err != nil:
+	if err != nil {
 		lines = append(lines, extension.Line{{Text: err.Error(), Tone: extension.ToneBad}})
-	default:
+	} else {
 		f.e.ui.Notify("Added " + h.Name + " (" + h.Destination + ")")
 		f.e.wakeLoop(h.Name)
 		f.handle.Close()
@@ -599,109 +494,8 @@ func (f *addForm) setLines(lines []extension.Line) {
 	f.handle.Refresh()
 }
 
-func (f *addForm) snapshotLines() []extension.Line {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]extension.Line(nil), f.lines...)
-}
-
-// Closed puts the machines screen back, unless the form handed the
-// operator a setup row to go to, or another view took its place.
+// Closed puts the machines screen back unless another view took its place.
 func (f *addForm) Closed(reason extension.CloseReason) {
-	f.mu.Lock()
-	leave := f.leave
-	f.mu.Unlock()
-	if !leave && reason != extension.CloseReplaced {
-		f.e.openMachines(f.ctx)
-	}
-}
-
-// openSetupRow starts a setup row named name: a pane running `machines
-// attach` with args, which runs `machines add` or a machine's fix there,
-// where the operator types what it asks. It is pinned to waiting, so
-// triage hands it over. It waits on the board, so call it off the event
-// loop.
-func (e *Extension) openSetupRow(ctx context.Context, name string, args []string) (string, error) {
-	e.boardMu.Lock()
-	board := e.board
-	e.boardMu.Unlock()
-	if board == nil {
-		return "", errors.New("the board is not running its loop yet; try again in a moment")
-	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	info, err := board.Launch(ctx, extension.LaunchRequest{
-		Tool: toolName,
-		Name: name,
-		Role: setupRoleName,
-		Args: args,
-	})
-	if err != nil {
-		return "", fmt.Errorf("could not open a setup row: %w", err)
-	}
-	// Triage hands a waiting row over. A pin that fails leaves the row
-	// idle, which is still on the list to open.
-	_ = board.PinStatus(ctx, info.ID, "waiting")
-	return info.Name, nil
-}
-
-// openRename shows the rename form for an added machine.
-func (e *Extension) openRename(ctx context.Context, name string) {
-	f := &renameForm{e: e, ctx: ctx, from: name}
-	f.handle = e.ui.Open(renameScreen, f)
-}
-
-type renameForm struct {
-	e      *Extension
-	ctx    context.Context
-	handle extension.ViewHandle
-	from   string
-	mu     sync.Mutex
-	err    string
-}
-
-func (f *renameForm) Title() string { return "Rename " + f.from }
-
-func (f *renameForm) Fields() []extension.Field {
-	return []extension.Field{{ID: "name", Label: "New name", Value: f.from}}
-}
-
-func (f *renameForm) Render(int, int) []extension.Line {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	lines := []extension.Line{{{Text: "The board brings its mirrors back under the new name."}}}
-	if f.err != "" {
-		lines = append(lines, extension.Line{{Text: f.err, Tone: extension.ToneBad}})
-	}
-	return lines
-}
-
-func (f *renameForm) Key(k extension.ViewKey) bool {
-	if k.Action != extension.ActionSubmit {
-		return false
-	}
-	to := strings.TrimSpace(k.Values["name"])
-	if to == f.from {
-		return true
-	}
-	// Saving takes the machines file's lock, which another process can
-	// hold, so it runs off the event loop.
-	go func() {
-		if err := f.e.renameMachine(f.from, to); err != nil {
-			f.mu.Lock()
-			f.err = err.Error()
-			f.mu.Unlock()
-			f.handle.Refresh()
-			return
-		}
-		f.e.ui.Notify("Renamed " + f.from + " to " + to)
-		f.e.wakeLoop(to)
-		f.handle.Close()
-	}()
-	return false
-}
-
-func (f *renameForm) Closed(reason extension.CloseReason) {
 	if reason != extension.CloseReplaced {
 		f.e.openMachines(f.ctx)
 	}

@@ -73,13 +73,12 @@ type mirrors struct {
 	lastErr   map[string]string
 	skipped   map[string]int
 	// current is the mirrors this run of the board launched or reconnected.
-	current  map[string]bool
-	wake     <-chan string
-	since    map[string]time.Time
-	stopped  map[string]bool
-	owned    map[string]bool
-	tools    *toolCache
-	previews *previewRoutes
+	current map[string]bool
+	wake    <-chan string
+	since   map[string]time.Time
+	stopped map[string]bool
+	owned   map[string]bool
+	tools   *toolCache
 	// reg is where the machines come from, read again every pass so one
 	// added or paused from a shell shows up without a restart.
 	reg *registry
@@ -109,7 +108,7 @@ func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logge
 		stopped: map[string]bool{},
 		owned:   map[string]bool{},
 	}
-	m.reg = newRegistry(cfg.Hosts, dataDir)
+	m.reg = newRegistry(dataDir)
 	m.state = m.load()
 	return m
 }
@@ -142,12 +141,11 @@ func (m *mirrors) pass(ctx context.Context) {
 	hosts := m.reg.active()
 	observed := m.observe(ctx, hosts)
 	m.publish(observed)
-	local, setups, err := m.localRows(ctx)
+	local, err := m.localRows(ctx)
 	if err != nil {
 		m.log.Warn("could not list the board's mirrors", "err", err)
 		return
 	}
-	m.closeSetups(ctx, setups)
 	actions, next := plan(m.state, hosts, observed, local, m.pinned, m.current)
 	for _, key := range sortedKeys(next.Dismissed) {
 		if _, before := m.state.Dismissed[key]; !before {
@@ -225,9 +223,6 @@ func (m *mirrors) pass(ctx context.Context) {
 		}
 	}
 	m.state = next
-	if m.previews != nil {
-		m.previews.update(next, observed)
-	}
 	m.decorate(observed, local)
 }
 
@@ -318,7 +313,7 @@ func (m *mirrors) observeOne(ctx context.Context, h host) observation {
 		m.lastErr[h.Name] = msg
 	}
 	// Running sessions a mirror cannot reach are adopted panes, or a
-	// tmux_socket this config has wrong. Either way the operator should be
+	// tmux server the other board did not report. The operator should be
 	// able to find out why they are missing.
 	unreachable := 0
 	for _, s := range obs.Snapshot.Sessions {
@@ -336,48 +331,24 @@ func (m *mirrors) observeOne(ctx context.Context, h host) observation {
 	return obs
 }
 
-// localRows is every unarchived mirror row on this board, and every
-// setup row.
-func (m *mirrors) localRows(ctx context.Context) (map[string]extension.SessionInfo, map[string]extension.SessionInfo, error) {
+// localRows is every unarchived mirror row on this board.
+func (m *mirrors) localRows(ctx context.Context) (map[string]extension.SessionInfo, error) {
 	local := map[string]extension.SessionInfo{}
-	setups := map[string]extension.SessionInfo{}
 	after := ""
 	for {
 		page, err := m.board.List(ctx, extension.SessionFilter{After: after})
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		for _, s := range page.Sessions {
-			switch {
-			case s.Archived:
-			case s.Role == mirrorRole:
+			if !s.Archived && s.Role == mirrorRole {
 				local[s.ID] = s
-			case s.Role == setupRole:
-				setups[s.ID] = s
 			}
 		}
 		if !page.Truncated || page.Cursor == "" {
-			return local, setups, nil
+			return local, nil
 		}
 		after = page.Cursor
-	}
-}
-
-// closeSetups archives each setup row whose pane has finished: its
-// machine was added or not, and the row has nothing more to show. The pane
-// marks itself done, since a pane whose command ends is left on a shell
-// and still reads as running.
-func (m *mirrors) closeSetups(ctx context.Context, setups map[string]extension.SessionInfo) {
-	for _, id := range sortedKeys(setups) {
-		if setups[id].Running && !setupDone(m.reg.dir, id) {
-			continue
-		}
-		if err := m.board.Archive(ctx, id); err != nil {
-			m.log.Warn("could not archive a finished setup row", "session", id, "err", err)
-			continue
-		}
-		clearSetupDone(m.reg.dir, id)
-		m.log.Info("archived a finished setup row", "session", id)
 	}
 }
 
