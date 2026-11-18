@@ -291,7 +291,7 @@ func (e *Extension) listOnce(ctx context.Context, h host) (snapshot, error) {
 
 // notMirroredFix explains running sessions with nothing to attach to on
 // the tmux server the machine's own board reports using.
-const notMirroredFix = "its running sessions have no gi_ tmux session there, as with panes its board adopted, so they aren't mirrored; bring one into that board with ctrl+alt+a to mirror it"
+const notMirroredFix = "its running sessions have no gi_ tmux session there, as with panes its board adopted, so they aren't mirrored; press a on that board to bring a pane in"
 
 // findThroughLogin is where the machine's login shell finds program, or
 // "" when it finds none.

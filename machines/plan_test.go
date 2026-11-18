@@ -220,3 +220,34 @@ func TestPinStatusCoversEveryBoardStatus(t *testing.T) {
 		t.Error("a waiting session must stay waiting, or triage never hands it over")
 	}
 }
+
+func TestPlanStoppedBoardMirrorsLiveSessionsWithoutStatus(t *testing.T) {
+	prev := withMirrors("mini/a1", "l1")
+	obs := seen(mini, live("b2", "waiting"))
+	obs.Snapshot.BoardRunning = boolPtr(false)
+	actions, next := plan(prev, []host{mini}, []observation{obs}, rows(mirrorRow("l1", true)), nil)
+	if got := describe(actions); strings.Join(got, ",") != "launch mini/b2" {
+		t.Fatal(got)
+	}
+	if !sameState(prev, next) {
+		t.Fatal("a stopped board should keep existing mirrors", next)
+	}
+	obs = seen(mini, live("a1", "waiting"))
+	obs.Snapshot.BoardRunning = boolPtr(false)
+	for _, running := range []bool{false, true} {
+		actions, _ = plan(prev, []host{mini}, []observation{obs}, rows(mirrorRow("l1", running)), nil)
+		if len(actions) != 0 {
+			t.Fatal(describe(actions))
+		}
+	}
+}
+
+func TestTwoMachinesKeepIndependentStatus(t *testing.T) {
+	prev := withMirrors("mini/a1", "aa", "box/b2", "bb")
+	local := rows(mirrorRow("aa", true), mirrorRow("bb", true))
+	acts, next := plan(prev, []host{mini, box}, []observation{unreachable(mini), seen(box, live("b2", "waiting"))}, local, map[string]string{"aa": "working", "bb": "working"})
+	got := strings.Join(describe(acts), ";")
+	if got != "pin bb waiting" || !sameState(prev, next) {
+		t.Fatal(got, next)
+	}
+}

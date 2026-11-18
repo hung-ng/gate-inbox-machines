@@ -34,7 +34,7 @@ type farMachine struct {
 
 func healthyFar() *farMachine {
 	socket := ""
-	return &farMachine{snap: snapshot{Version: wireVersion, BoardRunning: boolPtr(true), About: &about{
+	return &farMachine{snap: snapshot{Version: wireVersion, Sessions: []machineSession{}, BoardRunning: boolPtr(true), About: &about{
 		Hostname: "Box-1.local", OS: "linux", GateInbox: "/home/me/go/bin/gate-inbox",
 		Tmux: "/usr/bin/tmux", TmuxSocket: &socket, Version: Version,
 	}}}
@@ -699,26 +699,33 @@ func TestMachinesScreenStartsOnRenderAndCancelsLoadOnClose(t *testing.T) {
 	}
 }
 
-func TestMachinesScreenRemovesOnTheSecondPress(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	far := healthyFar()
-	e := newManaged(t, far)
-	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box"}, &bytes.Buffer{}); err != nil {
-		t.Fatal(err)
-	}
-	u := &screenUI{}
-	e.ui = u
-	e.openMachines(context.Background())
-	_, view := u.last()
-	v := view.(*machinesView)
-	v.Key(extension.ViewKey{Action: actionRemove, Key: "d"})
-	if len(e.machines().all()) != 1 || !strings.Contains(text(v.Render(120, 40)), "Press d again to remove box") {
-		t.Fatal(text(v.Render(120, 40)))
-	}
-	v.Key(extension.ViewKey{Action: actionRemove, Key: "d"})
-	waitFor(t, "the removal", func() bool { return len(e.machines().all()) == 0 })
-	if !strings.Contains(text(v.Render(120, 40)), "No machines yet") {
-		t.Fatal(text(v.Render(120, 40)))
+func TestMachinesScreenConfirmsRemoval(t *testing.T) {
+	for _, confirm := range []string{"y", "enter"} {
+		t.Run(confirm, func(t *testing.T) {
+			e := newManaged(t, healthyFar(), box)
+			u := &screenUI{}
+			e.ui = u
+			e.openMachines(context.Background())
+			_, view := u.last()
+			v := view.(*machinesView)
+			remove := extension.ViewKey{Action: actionRemove, Key: "x"}
+			v.Key(remove)
+			if len(e.machines().all()) != 1 || !strings.Contains(text(v.Render(120, 40)), "Remove box?") {
+				t.Fatal(text(v.Render(120, 40)))
+			}
+			if v.Key(extension.ViewKey{Action: actionBack, Key: "esc"}) {
+				t.Fatal("Escape closed the screen instead of canceling removal")
+			}
+			if v.confirm != "" || len(e.machines().all()) != 1 {
+				t.Fatal("Escape did not cancel removal")
+			}
+			v.Key(remove)
+			v.Key(extension.ViewKey{Key: confirm})
+			waitFor(t, "the removal", func() bool { return len(e.machines().all()) == 0 })
+			if !strings.Contains(text(v.Render(120, 40)), "No machines yet") {
+				t.Fatal(text(v.Render(120, 40)))
+			}
+		})
 	}
 }
 
@@ -1007,7 +1014,15 @@ func TestRegistryReadsDontWaitOnTheFileLock(t *testing.T) {
 		r.learn("box", "box", about{Hostname: "box"})
 		close(learned)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	// learn holds io while waiting for the file lock. Wait for that
+	// point before testing reads that must use only mu.
+	waitFor(t, "learn to acquire the registry I/O lock", func() bool {
+		if !r.io.TryLock() {
+			return true
+		}
+		r.io.Unlock()
+		return false
+	})
 	read := make(chan struct{})
 	go func() {
 		r.all()

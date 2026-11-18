@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/usestring/gate-inbox/extension"
 )
 
 // exitStatus stands in for an *exec.ExitError.
@@ -32,7 +35,7 @@ func TestCheckFailures(t *testing.T) {
 		{3, "not found", "", "make it available on PATH"},
 		{4, "", "garbage", "sessions reply FAIL"},
 		{4, "", `{"version":2}`, "same build on both"},
-		{5, "", `{"version":1,"board_running":false}`, "start that machine's board"},
+		{5, "", `{"version":1,"board_running":false,"sessions":[]}`, "start that machine's board"},
 		{6, "", `{"version":1,"sessions":[{"id":"a1"}]}`, "check tmux_socket"},
 	} {
 		t.Run(tc.want+tc.msg, func(t *testing.T) {
@@ -97,5 +100,30 @@ func TestSpawnReplyGreeting(t *testing.T) {
 		if parseSpawnReply([]byte(s)) == nil {
 			t.Fatal(s)
 		}
+	}
+}
+
+type callerHost struct {
+	extension.Host
+	caller string
+}
+
+func (h callerHost) Caller() string { return h.caller }
+
+func TestMachinesCLIMutationsRequireOperator(t *testing.T) {
+	e := newManaged(t, healthyFar(), mini)
+	for _, verb := range []string{"add", "remove", "pause", "resume"} {
+		if err := e.runMachines(context.Background(), []string{verb, "mini"}, callerHost{caller: "a1"}); err == nil || !strings.Contains(err.Error(), "operator terminal") {
+			t.Fatalf("%s from an agent: %v", verb, err)
+		}
+	}
+	if err := e.runMachines(context.Background(), []string{"pause", "mini"}, callerHost{}); err != nil {
+		t.Fatal(err)
+	}
+	if h, ok := e.machines().host("mini"); !ok || !h.Paused {
+		t.Fatal(h, ok)
+	}
+	if err := e.runMachines(context.Background(), []string{"check", "--help"}, callerHost{caller: "a1"}); !errors.Is(err, flag.ErrHelp) {
+		t.Fatal(err)
 	}
 }

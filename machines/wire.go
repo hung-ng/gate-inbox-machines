@@ -73,29 +73,50 @@ const (
 // tmuxSessions read them.
 func listSessions(ctx context.Context, sessions extension.SessionService, attachable map[string]bool) (snapshot, error) {
 	snap := snapshot{Version: wireVersion, Sessions: []machineSession{}}
-	after := ""
+	rows, err := allSessions(ctx, sessions.List)
+	if err != nil {
+		return snapshot{}, err
+	}
+	for _, s := range rows {
+		// The picker can launch the mirror tool without the mirror role.
+		// Those panes have no target and are left out too.
+		if s.Terminal || s.Archived || s.Role == mirrorRole || s.Tool == toolName || s.Tool == "machines" {
+			continue
+		}
+		snap.Sessions = append(snap.Sessions, machineSession{
+			ID: s.ID, Name: s.Name, Tool: s.Tool, Group: s.Group,
+			Status: s.Status, Running: s.Running, ParentID: s.ParentID,
+			Attachable: attachable[s.ID],
+		})
+	}
+	return snap, nil
+}
+
+func allSessions(ctx context.Context, list func(context.Context, extension.SessionFilter) (extension.SessionList, error)) ([]extension.SessionInfo, error) {
+	var rows []extension.SessionInfo
+	seen := map[string]bool{}
+	cursors := map[string]bool{}
+	filter := extension.SessionFilter{Limit: 500}
 	for {
-		page, err := sessions.List(ctx, extension.SessionFilter{After: after})
+		page, err := list(ctx, filter)
 		if err != nil {
-			return snapshot{}, err
+			return nil, err
 		}
-		for _, s := range page.Sessions {
-			// A session on the machines tool without the mirror role is one
-			// somebody started from the picker by hand: an attach with
-			// nothing to attach to, not an agent.
-			if s.Terminal || s.Archived || s.Role == mirrorRole || s.Tool == toolName || s.Tool == "machines" {
-				continue
+		for _, row := range page.Sessions {
+			if seen[row.ID] {
+				return nil, fmt.Errorf("board listed session %s twice", row.ID)
 			}
-			snap.Sessions = append(snap.Sessions, machineSession{
-				ID: s.ID, Name: s.Name, Tool: s.Tool, Group: s.Group,
-				Status: s.Status, Running: s.Running, ParentID: s.ParentID,
-				Attachable: attachable[s.ID],
-			})
+			seen[row.ID] = true
 		}
-		if !page.Truncated || page.Cursor == "" {
-			return snap, nil
+		rows = append(rows, page.Sessions...)
+		if !page.Truncated {
+			return rows, nil
 		}
-		after = page.Cursor
+		if page.Cursor == "" || cursors[page.Cursor] {
+			return nil, errors.New("board returned an incomplete session list without a new cursor")
+		}
+		cursors[page.Cursor] = true
+		filter.After = page.Cursor
 	}
 }
 
@@ -104,9 +125,19 @@ func listSessions(ctx context.Context, sessions extension.SessionService, attach
 // here: an id that is not a session id is dropped with the rest of the
 // reply rather than passed on to an attach.
 func parseSnapshot(r io.Reader) (snapshot, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxCommandOutput+1))
+	if err != nil {
+		return snapshot{}, err
+	}
+	if len(data) > maxCommandOutput {
+		return snapshot{}, errCommandOutput
+	}
+	return decodeSnapshot(data)
+}
+
+func decodeSnapshot(data []byte) (snapshot, error) {
 	var snap snapshot
-	decoder := json.NewDecoder(io.LimitReader(r, 8<<20))
-	if err := decoder.Decode(&snap); err != nil {
+	if err := json.Unmarshal(data, &snap); err != nil {
 		return snapshot{}, fmt.Errorf("the machine's reply is not a session list: %w", err)
 	}
 	return checkSnapshot(snap)
@@ -116,23 +147,28 @@ func parseSnapshot(r io.Reader) (snapshot, error) {
 // shell, whose login files may print a greeting first: the list is the
 // first line that starts one.
 func parseSnapshotAfterGreeting(out []byte) (snapshot, error) {
+	if len(out) > maxCommandOutput {
+		return snapshot{}, errCommandOutput
+	}
 	var first error
 	for offset := 0; offset < len(out); {
-		snap, err := parseSnapshot(bytes.NewReader(out[offset:]))
-		if err == nil {
-			return snap, nil
+		line, rest, more := bytes.Cut(out[offset:], []byte("\n"))
+		if line = bytes.TrimSpace(line); len(line) > 0 && line[0] == '{' {
+			snap, err := decodeSnapshot(out[offset:])
+			if err == nil {
+				return snap, nil
+			}
+			if first == nil {
+				first = err
+			}
 		}
-		if first == nil {
-			first = err
-		}
-		i := bytes.IndexByte(out[offset:], '\n')
-		if i < 0 {
+		if !more {
 			break
 		}
-		offset += i + 1
+		offset = len(out) - len(rest)
 	}
 	if first == nil {
-		first = errors.New("the machine's reply is empty")
+		first = errors.New("the machine's reply contains no session list")
 	}
 	return snapshot{}, first
 }
@@ -140,6 +176,9 @@ func parseSnapshotAfterGreeting(out []byte) (snapshot, error) {
 func checkSnapshot(snap snapshot) (snapshot, error) {
 	if snap.Version != wireVersion {
 		return snapshot{}, fmt.Errorf("the machine's build speaks version %d of the session list and this one speaks %d; run the same build on both", snap.Version, wireVersion)
+	}
+	if snap.Sessions == nil {
+		return snapshot{}, errors.New("the machine's reply must include a sessions array")
 	}
 	seen := map[string]bool{}
 	for _, s := range snap.Sessions {
@@ -186,7 +225,7 @@ var errNoSessions = errors.New("the board lent this command no session service")
 func tmuxSessions(ctx context.Context, run runner, argv []string) (map[string]bool, error) {
 	out, err := run(ctx, append(append([]string{}, argv...), "list-sessions", "-F", "#{session_name} #{session_attached}"))
 	if err != nil {
-		if tmuxHasNothing(err) {
+		if tmuxHasNothing(err, false) {
 			return map[string]bool{}, nil
 		}
 		return nil, fmt.Errorf("could not list tmux sessions: %w", err)
@@ -194,16 +233,16 @@ func tmuxSessions(ctx context.Context, run runner, argv []string) (map[string]bo
 	return parseTmuxSessions(string(out)), nil
 }
 
-// tmuxHasNothing is whether a failed tmux listing only means there was
-// nothing to list: no server on the socket, or a server kept up with no
-// sessions (exit-empty off), where list-panes -a fails with "no current
-// target". Keeping the agents' server up that way is how a Mac lets an agent
-// started over ssh read the login keychain, so it must not read as a failure.
-func tmuxHasNothing(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "no server running") ||
-		strings.Contains(msg, "error connecting to") ||
-		strings.Contains(msg, "no current target")
+// tmuxHasNothing checks the final tmux diagnostic. Other socket errors
+// also start with "error connecting to", including a non-socket at the path.
+func tmuxHasNothing(err error, panes bool) bool {
+	msg := lastLine(strings.TrimSpace(err.Error()))
+	if strings.HasPrefix(msg, "exit status ") {
+		_, msg, _ = strings.Cut(msg, ": ")
+	}
+	return strings.HasPrefix(msg, "no server running on ") ||
+		(strings.HasPrefix(msg, "error connecting to ") && strings.HasSuffix(msg, " (No such file or directory)")) ||
+		(panes && msg == "no current target")
 }
 
 func parseTmuxSessions(out string) map[string]bool {
@@ -244,7 +283,7 @@ func boardRunning(dir string) bool {
 func tmuxScrolling(ctx context.Context, run runner, argv []string) (map[string]bool, error) {
 	out, err := run(ctx, append(append([]string{}, argv...), "list-panes", "-a", "-F", "#{session_name} #{pane_in_mode}"))
 	if err != nil {
-		if tmuxHasNothing(err) {
+		if tmuxHasNothing(err, true) {
 			return map[string]bool{}, nil
 		}
 		return nil, fmt.Errorf("could not list tmux pane modes: %w", err)

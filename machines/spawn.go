@@ -19,11 +19,11 @@ func spawnArgv(cfg config, h host, cli, task, directory string) []string {
 	if task != "" {
 		args = append(args, "--prompt", task)
 	}
+	command := machineCommand(h, h.GateInbox, args...)
 	if directory != "" {
-		args = append(args, "--directory", directory)
+		command += " --directory " + shellPath(directory)
 	}
-	args = append(args, "--json")
-	return loginShell(cfg, h.Destination, machineCommand(h, h.GateInbox, args...))
+	return loginShell(cfg, h.Destination, command+" --json")
 }
 
 func availableTools(ctx context.Context, h extension.Host) ([]string, error) {
@@ -43,7 +43,7 @@ func availableTools(ctx context.Context, h extension.Host) ([]string, error) {
 
 func (e *Extension) machineUI() extension.UI {
 	keys := []extension.KeyBinding{
-		{Screen: extension.ScreenList, Action: "new_on_machine", Label: "new session on another machine", Keys: []string{"N"},
+		{Screen: extension.ScreenList, Action: "new_on_machine", Label: "new session on another machine", Keys: []string{"N", "shift+n"},
 			Run: func(ctx context.Context, _ extension.Press) error {
 				if len(e.machines().active()) == 0 {
 					// With nowhere to start a session, N is the way to add a
@@ -54,7 +54,7 @@ func (e *Extension) machineUI() extension.UI {
 				e.openSpawn(ctx, "")
 				return nil
 			}},
-		{Screen: extension.ScreenList, Action: "machines", Label: "add and manage your other machines", Keys: []string{"O"},
+		{Screen: extension.ScreenList, Action: "machines", Label: "add and manage your other machines", Keys: []string{"O", "shift+o"},
 			Run: func(ctx context.Context, _ extension.Press) error {
 				e.openMachines(ctx)
 				return nil
@@ -141,10 +141,7 @@ func (f *spawnForm) Key(k extension.ViewKey) bool {
 		} else {
 			f.e.ui.Notify("Started session on " + name)
 		}
-		select {
-		case f.e.wake <- name:
-		default:
-		}
+		f.e.wakeLoop(name)
 	}()
 	return true
 }

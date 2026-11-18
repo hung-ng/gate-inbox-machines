@@ -111,3 +111,27 @@ func TestTmuxListingsOnAnEmptyServer(t *testing.T) {
 		t.Errorf("pane modes on an empty server: got %v, %v; want none and no error", got, err)
 	}
 }
+
+func TestTmuxListingsRejectSocketFailures(t *testing.T) {
+	for _, msg := range []string{
+		"exit status 1: error connecting to /tmp/tmux-501/agents (Socket operation on non-socket)",
+		"exit status 1: error connecting to /tmp/tmux-501/agents (Permission denied)",
+	} {
+		run := func(context.Context, []string) ([]byte, error) { return nil, errors.New(msg) }
+		if _, err := tmuxSessions(context.Background(), run, []string{"tmux"}); err == nil {
+			t.Fatal("list-sessions accepted", msg)
+		}
+		if _, err := tmuxScrolling(context.Background(), run, []string{"tmux"}); err == nil {
+			t.Fatal("list-panes accepted", msg)
+		}
+	}
+	run := func(context.Context, []string) ([]byte, error) {
+		return nil, errors.New("exit status 1: no current target")
+	}
+	if _, err := tmuxSessions(context.Background(), run, []string{"tmux"}); err == nil {
+		t.Fatal("list-sessions accepted no current target")
+	}
+	if got, err := tmuxScrolling(context.Background(), run, []string{"tmux"}); err != nil || len(got) != 0 {
+		t.Fatal(got, err)
+	}
+}

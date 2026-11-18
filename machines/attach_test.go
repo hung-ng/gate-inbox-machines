@@ -19,7 +19,7 @@ type scripted struct {
 	sleeps []time.Duration
 }
 
-func (s *scripted) run(context.Context, []string) (int, error) {
+func (s *scripted) run(context.Context) (int, error) {
 	code := s.codes[s.runs]
 	s.runs++
 	return code, nil
@@ -37,15 +37,15 @@ func (s *scripted) sleep(_ context.Context, d time.Duration) error {
 func TestAttachLoopRetriesEveryFailureUntilThePaneCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &scripted{codes: []int{sshFailed, sshFailed, 0, 1, 1, 127}}
-	run := func(ctx context.Context, argv []string) (int, error) {
+	run := func(ctx context.Context) (int, error) {
 		if s.runs == len(s.codes)-1 {
 			cancel()
 		}
-		return s.run(ctx, argv)
+		return s.run(ctx)
 	}
 	var out bytes.Buffer
 	var notes []int
-	err := attachLoop(ctx, &out, run, []string{"ssh"}, "mini", "a1", s.sleep, func(code int, _ string) { notes = append(notes, code) })
+	err := attachLoop(ctx, &out, run, "mini", "a1", s.sleep, func(code int, _ string) { notes = append(notes, code) })
 	if err != context.Canceled {
 		t.Fatalf("err = %v, want context.Canceled: only closing the pane ends it", err)
 	}
@@ -80,13 +80,13 @@ func TestAttachLoopBacksOffToACap(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &scripted{codes: codes}
-	run := func(ctx context.Context, argv []string) (int, error) {
+	run := func(ctx context.Context) (int, error) {
 		if s.runs == len(s.codes)-1 {
 			cancel()
 		}
-		return s.run(ctx, argv)
+		return s.run(ctx)
 	}
-	_ = attachLoop(ctx, &bytes.Buffer{}, run, []string{"ssh"}, "mini", "a1", s.sleep, nil)
+	_ = attachLoop(ctx, &bytes.Buffer{}, run, "mini", "a1", s.sleep, nil)
 	if last := s.sleeps[len(s.sleeps)-1]; last != maxRetry {
 		t.Errorf("last retry = %s, want the cap %s", last, maxRetry)
 	}
@@ -97,16 +97,16 @@ func TestAttachLoopSaysWhenTmuxIsMissing(t *testing.T) {
 	s := &scripted{codes: []int{127}}
 	stop := func(context.Context, time.Duration) error { cancel(); return context.Canceled }
 	var out bytes.Buffer
-	_ = attachLoop(ctx, &out, s.run, []string{"ssh"}, "mini", "a1", stop, nil)
-	if !strings.Contains(out.String(), "full path") {
+	_ = attachLoop(ctx, &out, s.run, "mini", "a1", stop, nil)
+	if !strings.Contains(out.String(), "has no tmux") {
 		t.Errorf("pane said %q", out.String())
 	}
 }
 
 func TestAttachLoopStopsWithItsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	run := func(context.Context, []string) (int, error) { cancel(); return 0, nil }
-	err := attachLoop(ctx, &bytes.Buffer{}, run, []string{"ssh"}, "mini", "a1", sleepCtx, nil)
+	run := func(context.Context) (int, error) { cancel(); return 0, nil }
+	err := attachLoop(ctx, &bytes.Buffer{}, run, "mini", "a1", sleepCtx, nil)
 	if err != context.Canceled {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
@@ -121,7 +121,7 @@ func TestRunAttachDropsTheEmptyPromptAndChecksItsOperands(t *testing.T) {
 	if len(argv) == 0 || argv[len(argv)-1] != "exec tmux -u attach-session -t '=gi_ab12'" {
 		t.Errorf("ran %q", argv)
 	}
-	for _, args := range [][]string{{"nowhere", "ab12"}, {"mini", "AB;x"}, {"mini"}} {
+	for _, args := range [][]string{{"mini", "AB;x"}, {"mini"}} {
 		if err := e.runAttach(context.Background(), args, nil); err == nil {
 			t.Errorf("attach %q ran, want an error", args)
 		}
@@ -165,5 +165,40 @@ func TestRunAttachWaitsForMissingMirrorMapping(t *testing.T) {
 	defer cancel()
 	if err := e.runAttach(ctx, nil, nil); err != nil || ctx.Err() != context.DeadlineExceeded {
 		t.Fatalf("attach returned before cancellation: %v, context %v", err, ctx.Err())
+	}
+}
+
+func TestRunAttachReloadsLearnedSocketAfterFailure(t *testing.T) {
+	e := newManaged(t, healthyFar(), mini)
+	reg := e.machines()
+	if err := os.WriteFile(filepath.Join(reg.dir, learnedFileName), []byte("null"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	var commands []string
+	e.attach = func(_ context.Context, argv []string) (int, error) {
+		commands = append(commands, argv[len(argv)-1])
+		if len(commands) == 1 {
+			socket := "learned"
+			if _, err := reg.learn(mini.Name, mini.Destination, about{TmuxSocket: &socket}); err != nil {
+				t.Fatal(err)
+			}
+			// Use a separate registry to mimic the board writing this file.
+			writer := newRegistry(reg.dir)
+			socket = "updated"
+			if _, err := writer.learn(mini.Name, mini.Destination, about{TmuxSocket: &socket}); err != nil {
+				t.Fatal(err)
+			}
+			return sshFailed, nil
+		}
+		cancel()
+		return 0, nil
+	}
+	if err := e.runAttach(ctx, []string{mini.Name, "ab12"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 2 || strings.Contains(commands[0], "-L") || !strings.Contains(commands[1], "-L updated") {
+		t.Fatal(commands)
 	}
 }

@@ -190,6 +190,14 @@ func (e *Extension) Commands() []extension.Command {
 }
 
 func (e *Extension) runMachines(ctx context.Context, args []string, host extension.Host) error {
+	operatorOnly := func(verb string, run func([]string) error) func([]string) error {
+		return func(args []string) error {
+			if host != nil && host.Caller() != "" {
+				return fmt.Errorf("run machines %s from an operator terminal outside a Gate Inbox session", verb)
+			}
+			return run(args)
+		}
+	}
 	return cmdline.Dispatch(os.Stdout, program, "machines", []cmdline.Verb{
 		{
 			Name: "sessions", Usage: usageSessions,
@@ -204,27 +212,33 @@ func (e *Extension) runMachines(ctx context.Context, args []string, host extensi
 		{
 			Name: "check", Usage: usageCheck,
 			About: "check that each configured machine can be polled and attached to, and say what to fix",
-			Run:   func(args []string) error { return e.runCheck(ctx, args, os.Stdout) },
+			Run: func(args []string) error {
+				names, err := cmdline.Parse(os.Stdout, program, cmdline.NewFlagSet(usageCheck), args, 0, cmdline.AnyNumber)
+				if err != nil {
+					return err
+				}
+				return e.runCheck(ctx, names, os.Stdout)
+			},
 		},
 		{
 			Name: "add", Usage: usageAdd,
 			About: "check a machine by its ssh destination and add it",
-			Run:   func(args []string) error { return e.runAdd(ctx, args) },
+			Run:   operatorOnly("add", func(args []string) error { return e.runAdd(ctx, args) }),
 		},
 		{
 			Name: "remove", Usage: usageRemove,
 			About: "remove a machine added with add; its mirrors are put away",
-			Run:   func(args []string) error { return e.runRemove(args) },
+			Run:   operatorOnly("remove", e.runRemove),
 		},
 		{
 			Name: "pause", Usage: usagePause,
-			About: "stop polling a machine and put its mirrors away until it is resumed",
-			Run:   func(args []string) error { return e.runPause(args, true) },
+			About: "stop polling a machine and keep its mirrors",
+			Run:   operatorOnly("pause", func(args []string) error { return e.runPause(args, true) }),
 		},
 		{
 			Name: "resume", Usage: usageResume,
 			About: "poll a paused machine again",
-			Run:   func(args []string) error { return e.runPause(args, false) },
+			Run:   operatorOnly("resume", func(args []string) error { return e.runPause(args, false) }),
 		},
 		{
 			Name: "list", Usage: usageList,
@@ -314,22 +328,27 @@ func (e *Extension) runAttach(ctx context.Context, args []string, host extension
 		}
 		hostName, id = operands[0], operands[1]
 	}
-	h, ok := e.machines().host(hostName)
-	if !ok {
-		return fmt.Errorf("no machine %q: add it with `gate-inbox machines add`", hostName)
-	}
 	if !sessionIDPattern.MatchString(id) {
 		return fmt.Errorf("%q is not a session id", id)
 	}
-	if err := ensureControlDir(e.cfg.ControlPath); err != nil {
-		return err
+	reg := e.machines()
+	attempt := func(ctx context.Context) (int, error) {
+		reg.reload()
+		h, ok := reg.host(hostName)
+		if !ok {
+			return -1, fmt.Errorf("no machine %q: add it with `gate-inbox machines add`", hostName)
+		}
+		if err := ensureControlDir(e.cfg.ControlPath); err != nil {
+			return -1, err
+		}
+		return e.attach(ctx, attachArgv(e.cfg, h, id))
 	}
 	note := func(code int, msg string) {
 		if host != nil && host.Logger() != nil {
 			host.Logger().Warn("a mirror cannot attach", "machine", hostName, "session", id, "code", code, "err", msg)
 		}
 	}
-	err := attachLoop(ctx, os.Stderr, e.attach, attachArgv(e.cfg, h, id), hostName, id, sleepCtx, note)
+	err := attachLoop(ctx, os.Stderr, attempt, hostName, id, sleepCtx, note)
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}

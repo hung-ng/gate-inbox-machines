@@ -56,12 +56,12 @@ const (
 //
 // note is told about each failure once, until the attach next succeeds, so
 // the board's log can say why a mirror is stuck.
-func attachLoop(ctx context.Context, out io.Writer, run attachRunner, argv []string, hostName, id string,
+func attachLoop(ctx context.Context, out io.Writer, attempt func(context.Context) (int, error), hostName, id string,
 	sleep func(context.Context, time.Duration) error, note func(code int, msg string)) error {
 	retry := firstRetry
 	lastCode := 0
 	for {
-		code, err := run(ctx, argv)
+		code, err := attempt(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -76,11 +76,11 @@ func attachLoop(ctx context.Context, out io.Writer, run attachRunner, argv []str
 		switch {
 		case err != nil:
 			code = -1
-			msg = fmt.Sprintf("could not run ssh: %v", err)
+			msg = fmt.Sprintf("could not attach: %v", err)
 		case code == sshFailed:
 			msg = "lost the connection to " + hostName
 		case code == 127:
-			msg = hostName + " has no tmux on the PATH ssh gives it; set tmux for this machine to its full path"
+			msg = hostName + " has no tmux on the PATH ssh gives it"
 		default:
 			msg = fmt.Sprintf("tmux on %s would not attach to gi_%s (exit %d)", hostName, id, code)
 		}

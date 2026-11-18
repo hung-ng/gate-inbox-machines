@@ -3,13 +3,13 @@ package machines
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +21,7 @@ import (
 // own BoardHost is one; tests use a fake.
 type boardOps interface {
 	List(ctx context.Context, filter extension.SessionFilter) (extension.SessionList, error)
+	Get(ctx context.Context, id string) (extension.SessionInfo, error)
 	Launch(ctx context.Context, req extension.LaunchRequest) (extension.SessionInfo, error)
 	PinStatus(ctx context.Context, id, status string) error
 	Archive(ctx context.Context, id string) error
@@ -30,18 +31,57 @@ type boardOps interface {
 // one that answers without ssh.
 type runner func(ctx context.Context, argv []string) (stdout []byte, err error)
 
+const (
+	maxCommandOutput = 8 << 20
+	stderrTailSize   = 4 << 10
+)
+
+var errCommandOutput = errors.New("command output exceeds 8 MiB")
+
+type commandOutput struct {
+	buf       bytes.Buffer
+	oversized bool
+}
+
+func (out *commandOutput) Write(p []byte) (int, error) {
+	if len(p) > maxCommandOutput-out.buf.Len() {
+		out.oversized = true
+		return 0, errCommandOutput
+	}
+	return out.buf.Write(p)
+}
+
+type stderrTail []byte
+
+func (tail *stderrTail) Write(p []byte) (int, error) {
+	n := len(p)
+	if n >= stderrTailSize {
+		*tail = append((*tail)[:0], p[n-stderrTailSize:]...)
+		return n, nil
+	}
+	if skip := len(*tail) + n - stderrTailSize; skip > 0 {
+		*tail = (*tail)[:copy(*tail, (*tail)[skip:])]
+	}
+	*tail = append(*tail, p...)
+	return n, nil
+}
+
 func execRunner(ctx context.Context, argv []string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	var stdout, stderr bytes.Buffer
+	var stdout commandOutput
+	stderr := make(stderrTail, 0, stderrTailSize)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	cmd.Stdin = nil
-	if err := cmd.Run(); err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return nil, fmt.Errorf("%w: %s", err, lastLine(msg))
+	err := cmd.Run()
+	if stdout.oversized {
+		return nil, errCommandOutput
+	}
+	if err != nil {
+		if msg := strings.TrimSpace(string(stderr)); msg != "" {
+			return nil, fmt.Errorf("%w: %s", err, msg)
 		}
 		return nil, err
 	}
-	return stdout.Bytes(), nil
+	return stdout.buf.Bytes(), nil
 }
 
 func lastLine(s string) string {
@@ -57,25 +97,27 @@ const launchBackoff = 30 * time.Second
 
 // mirrors runs the reconcile loop on the board.
 type mirrors struct {
-	cfg       config
-	board     boardOps
-	ui        extension.UIHost
-	log       *slog.Logger
-	run       runner
-	observeMu sync.Mutex
-	path      string // the state file
-	now       func() time.Time
-	state     state
-	pinned    map[string]string
-	failed    map[string]time.Time
-	badges    map[string]string
-	lastErr   map[string]string
-	skipped   map[string]int
-	wake      <-chan string
-	since     map[string]time.Time
-	stopped   map[string]bool
-	owned     map[string]bool
-	tools     *toolCache
+	cfg        config
+	board      boardOps
+	ui         extension.UIHost
+	log        *slog.Logger
+	run        runner
+	observeMu  sync.Mutex
+	path       string // the state file
+	now        func() time.Time
+	state      state
+	dirty      bool
+	stateIssue string
+	pinned     map[string]string
+	failed     map[string]time.Time
+	badges     map[string]string
+	lastErr    map[string]string
+	skipped    map[string]int
+	wake       <-chan string
+	since      map[string]time.Time
+	stopped    map[string]bool
+	owned      map[string]bool
+	tools      *toolCache
 	// reg is where the machines come from, read again every pass so one
 	// added or paused from a shell shows up without a restart.
 	reg *registry
@@ -105,7 +147,7 @@ func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logge
 		owned:   map[string]bool{},
 	}
 	m.reg = newRegistry(dataDir)
-	m.state = m.load()
+	m.state = newState()
 	return m
 }
 
@@ -134,9 +176,17 @@ func (m *mirrors) pass(ctx context.Context) {
 		}
 		m.lastIssue = issue
 	}
-	hosts := m.reg.active()
-	observed := m.observe(ctx, hosts)
+	configured := m.reg.all()
+	active := slices.DeleteFunc(slices.Clone(configured), func(h host) bool { return h.Paused })
+	observed := m.observe(ctx, active)
 	m.publish(observed)
+	if !m.syncState() {
+		return
+	}
+	defer m.flushState()
+	if m.reg.issue() != "" {
+		return
+	}
 	local, err := m.localRows(ctx)
 	if err != nil {
 		m.log.Warn("could not list the board's mirrors", "err", err)
@@ -147,7 +197,7 @@ func (m *mirrors) pass(ctx context.Context) {
 			delete(m.pinned, id)
 		}
 	}
-	actions, next := plan(m.state, m.reg.all(), observed, local, m.pinned)
+	actions, next := plan(m.state, configured, observed, local, m.pinned)
 	for _, key := range sortedKeys(next.Dismissed) {
 		if _, before := m.state.Dismissed[key]; !before {
 			m.forget(next.Dismissed[key])
@@ -164,9 +214,12 @@ func (m *mirrors) pass(ctx context.Context) {
 		case actArchive:
 			if err := m.board.Archive(ctx, a.LocalID); err != nil {
 				m.log.Warn("could not archive a mirror", "session", a.LocalID, "key", a.Key, "err", err)
-			} else {
-				m.log.Info("archived a mirror", "session", a.LocalID, "key", a.Key, "why", a.Why)
+				if a.Key != "" {
+					next.Mirrors[a.Key] = a.LocalID
+				}
+				continue
 			}
+			m.log.Info("archived a mirror", "session", a.LocalID, "key", a.Key, "why", a.Why)
 			m.forget(a.LocalID)
 		case actPin:
 			m.pin(ctx, a.LocalID, a.Status)
@@ -188,11 +241,7 @@ func (m *mirrors) pass(ctx context.Context) {
 			}
 		}
 	}
-	if !sameState(m.state, next) {
-		if err := m.save(next); err != nil {
-			m.log.Warn("could not save the mirror state", "err", err)
-		}
-	}
+	m.dirty = m.dirty || !sameState(m.state, next)
 	m.state = next
 	m.decorate(observed, local)
 }
@@ -215,8 +264,7 @@ func (m *mirrors) pin(ctx context.Context, id, status string) {
 	m.pinned[id] = status
 }
 
-// observe polls every host at once, each bounded by its own timeout, so one
-// slow host does not hold the others' rows back.
+// observe polls hosts in parallel. Reconcile waits for the last reply or timeout.
 func (m *mirrors) observe(ctx context.Context, hosts []host) []observation {
 	observed := make([]observation, len(hosts))
 	var wg sync.WaitGroup
@@ -262,7 +310,7 @@ func (m *mirrors) observeOne(ctx context.Context, h host) observation {
 		}
 		if changed {
 			learned, ok := m.reg.host(h.Name)
-			if ok {
+			if ok && learned.About != nil && learned.Destination == h.Destination {
 				m.log.Info("machine described itself", "machine", h.Name, "hostname", learned.About.Hostname,
 					"gate_inbox", learned.GateInbox, "tmux", learned.Tmux, "tmux_socket", learned.TmuxSocket, "version", learned.About.Version)
 				// The reply said which sessions can be attached to through
@@ -314,22 +362,38 @@ func (m *mirrors) observeOne(ctx context.Context, h host) observation {
 // localRows is every unarchived mirror row on this board.
 func (m *mirrors) localRows(ctx context.Context) (map[string]extension.SessionInfo, error) {
 	local := map[string]extension.SessionInfo{}
-	after := ""
-	for {
-		page, err := m.board.List(ctx, extension.SessionFilter{After: after})
-		if err != nil {
-			return nil, err
-		}
-		for _, s := range page.Sessions {
-			if !s.Archived && s.Role == mirrorRole {
-				local[s.ID] = s
-			}
-		}
-		if !page.Truncated || page.Cursor == "" {
-			return local, nil
-		}
-		after = page.Cursor
+	rows, err := allSessions(ctx, m.board.List)
+	if err != nil {
+		return nil, err
 	}
+	for _, row := range rows {
+		if !row.Archived && row.Role == mirrorRole {
+			local[row.ID] = row
+		}
+	}
+	// A reorder during pagination can hide a row. Check any saved active
+	// row that List missed before letting plan treat it as dismissed.
+	for _, id := range m.state.Mirrors {
+		if _, ok := local[id]; ok {
+			continue
+		}
+		row, err := m.board.Get(ctx, id)
+		if err != nil {
+			// Stock v1.1.0 has no public sentinel for this error.
+			if strings.HasPrefix(err.Error(), "session "+id+" does not exist; call ") &&
+				strings.HasSuffix(err.Error(), " for current ids") {
+				continue
+			}
+			return nil, fmt.Errorf("look up mirror %s: %w", id, err)
+		}
+		if row.ID != id || row.Role != mirrorRole {
+			return nil, fmt.Errorf("unexpected row returned for mirror %s", id)
+		}
+		if !row.Archived {
+			local[id] = row
+		}
+	}
+	return local, nil
 }
 
 // pollHost asks one machine for its sessions. When the machine can't find
@@ -438,13 +502,49 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 	}
 }
 
-func (m *mirrors) load() state {
+// syncState checks the file before reconciling. Keep unsaved changes in
+// memory, but wait for a damaged file to be repaired before replacing it.
+func (m *mirrors) syncState() bool {
 	st, err := readState(m.path)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			m.log.Warn("could not read the mirror state; starting over", "path", m.path, "err", err)
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		if _, statErr := os.Lstat(m.path); errors.Is(statErr, os.ErrNotExist) {
+			err = nil
+			st = m.state
+			m.dirty = m.dirty || len(st.Mirrors)+len(st.Dismissed) > 0
 		}
-		return newState()
+	}
+	if err != nil {
+		if msg := err.Error(); msg != m.stateIssue {
+			m.log.Warn("could not read the mirror state; pausing reconcile", "path", m.path, "err", err)
+			m.stateIssue = msg
+		}
+		return false
+	}
+	m.stateIssue = ""
+	if !m.dirty {
+		m.state = st
+	}
+	return true
+}
+
+func (m *mirrors) flushState() {
+	if !m.dirty {
+		return
+	}
+	if err := writeJSON(m.path, m.state); err != nil {
+		m.log.Warn("could not save the mirror state", "err", err)
+		return
+	}
+	m.dirty = false
+}
+
+func readState(path string) (state, error) {
+	var st *state
+	if err := readJSON(path, &st); err != nil {
+		return state{}, err
+	}
+	if st == nil {
+		return state{}, errors.New("expected an object in mirrors.json")
 	}
 	if st.Mirrors == nil {
 		st.Mirrors = map[string]string{}
@@ -452,38 +552,7 @@ func (m *mirrors) load() state {
 	if st.Dismissed == nil {
 		st.Dismissed = map[string]string{}
 	}
-	return st
-}
-
-func readState(path string) (state, error) {
-	var st state
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return st, err
-	}
-	err = json.Unmarshal(data, &st)
-	return st, err
-}
-
-// save writes the state by rename, so a reader never sees half a file.
-func (m *mirrors) save(st state) error {
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(m.path), ".mirrors-*.json")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), m.path)
+	return *st, nil
 }
 
 func sameState(a, b state) bool {

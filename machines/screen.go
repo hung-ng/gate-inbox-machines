@@ -22,6 +22,7 @@ const (
 	actionCheck      = "check"
 	actionPause      = "pause"
 	actionRemove     = "remove"
+	actionBack       = "back"
 	actionNewSession = "new_session"
 )
 
@@ -30,9 +31,10 @@ func machinesKeys() []extension.KeyBinding {
 		{Screen: machinesScreen, Action: actionAdd, Keys: []string{"a"}, Label: "add a machine"},
 		{Screen: machinesScreen, Action: actionCheck, Keys: []string{"c"}, Label: "check the machine"},
 		{Screen: machinesScreen, Action: actionPause, Keys: []string{"space"}, Label: "pause or resume"},
-		{Screen: machinesScreen, Action: actionRemove, Keys: []string{"d"}, Label: "remove (press twice)"},
+		{Screen: machinesScreen, Action: actionRemove, Keys: []string{"x"}, Label: "remove"},
 		{Screen: machinesScreen, Action: actionNewSession, Keys: []string{"n"}, Label: "new session there"},
-		{Screen: machinesScreen, Action: extension.ActionClose, Keys: []string{"esc", "q"}, Label: "close"},
+		{Screen: machinesScreen, Action: actionBack, Keys: []string{"esc"}, Label: "cancel or close"},
+		{Screen: machinesScreen, Action: extension.ActionClose, Keys: []string{"q"}, Label: "close"},
 		{Screen: addScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "back"},
 	}
 }
@@ -154,7 +156,7 @@ func (v *machinesView) Render(width, height int) []extension.Line {
 		}
 	}
 	if v.confirm != "" {
-		tail = append(tail, extension.Line{{Text: "Press d again to remove " + v.confirm + ". The board puts its mirrors away, and its agents keep running.", Tone: extension.ToneWarn}})
+		tail = append(tail, extension.Line{{Text: "Remove " + v.confirm + "? Press y or Enter to archive its mirrors, or Esc to cancel. Its agents keep running.", Tone: extension.ToneWarn}})
 	}
 	if len(v.note) > 0 {
 		tail = append(append(tail, extension.Line{}), v.note...)
@@ -260,8 +262,21 @@ func plural(n int, word string) string {
 func (v *machinesView) Key(k extension.ViewKey) bool {
 	v.mu.Lock()
 	rows := v.rowsLocked()
-	if k.Action != actionRemove {
-		v.confirm = ""
+	if name := v.confirm; name != "" {
+		confirmed := k.Key == "y" || k.Key == "enter"
+		if confirmed || k.Action == actionBack || k.Key == "esc" {
+			v.confirm = ""
+		}
+		v.mu.Unlock()
+		if confirmed {
+			v.run("removing "+name+"...", func() []extension.Line {
+				err := v.e.removeMachine(name)
+				v.e.wakeLoop(name)
+				return outcome(err, "Removed "+name+".")
+			})
+		}
+		v.handle.Refresh()
+		return false
 	}
 	var current row
 	if v.cursor < len(rows) {
@@ -321,21 +336,13 @@ func (v *machinesView) Key(k extension.ViewKey) bool {
 	case actionRemove:
 		if current.machine != nil {
 			v.mu.Lock()
-			confirmed := v.confirm == current.machine.Name
-			v.confirm = ""
-			if !confirmed {
+			if !v.busy {
 				v.confirm = current.machine.Name
 			}
 			v.mu.Unlock()
-			if confirmed {
-				name := current.machine.Name
-				v.run("removing "+name+"...", func() []extension.Line {
-					err := v.e.removeMachine(name)
-					v.e.wakeLoop(name)
-					return outcome(err, "Removed "+name+".")
-				})
-			}
 		}
+	case actionBack:
+		return true
 	case actionNewSession:
 		if current.machine != nil && !current.machine.Paused {
 			v.e.openSpawn(v.ctx, current.machine.Name)

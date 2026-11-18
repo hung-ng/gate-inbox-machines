@@ -1,6 +1,6 @@
 module github.com/hung-ng/gate-inbox-machines
 
-go 1.27.4
+go 1.27.3
 
 require (
 	github.com/BurntSushi/toml v1.6.0

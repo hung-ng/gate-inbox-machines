@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 // The options every ssh this extension runs carries. BatchMode refuses a
@@ -25,7 +26,7 @@ var sshOptions = []string{
 // connection rather than twenty logins.
 func controlOptions(path string) []string {
 	if path == "none" {
-		return nil
+		return []string{"-o", "ControlPath=none"}
 	}
 	return []string{
 		"-o", "ControlMaster=auto",
@@ -41,7 +42,19 @@ func ensureControlDir(path string) error {
 	if path == "none" {
 		return nil
 	}
-	return os.MkdirAll(filepath.Dir(path), 0o700)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if info.Mode() != os.ModeDir|0o700 || !ok || int(stat.Uid) != os.Getuid() {
+		return fmt.Errorf("SSH control directory %q must be a real directory owned by uid %d with mode 0700", dir, os.Getuid())
+	}
+	return nil
 }
 
 // listArgv is the ssh command line that asks a host's board for its
@@ -84,7 +97,7 @@ func attachArgv(cfg config, h host, id string) []string {
 	// "=" makes tmux match the session name exactly rather than as a
 	// prefix, so gi_ab never attaches gi_abc.
 	args = append(args, "attach-session", "-t", "=gi_"+id)
-	command := "exec " + joinShell(args)
+	command := "exec " + shellPath(args[0]) + " " + joinShell(args[1:])
 	return sshArgv(cfg, true, h.Destination, command)
 }
 
@@ -107,23 +120,31 @@ func sshArgv(cfg config, tty bool, destination, command string) []string {
 // Homebrew's tmux is not on it. Configured executable directories go
 // first; fallbacks go after PATH so the user's choices win.
 func machineCommand(h host, program string, args ...string) string {
-	words := append([]string{program}, args...)
 	var dirs []string
 	for _, path := range []string{h.Tmux, h.GateInbox} {
 		if dir, _, ok := cutLastSlash(path); ok && dir != "" {
-			dirs = append(dirs, shellWord(dir))
+			if dir == "~" {
+				dir = "~/"
+			}
+			dirs = append(dirs, shellPath(dir))
 		}
 	}
 	dirs = append(dirs, `"$PATH"`, `"$HOME"/go/bin`, `"$HOME"/.local/bin`, "/opt/homebrew/bin", "/usr/local/bin")
 	env := []string{"PATH=" + strings.Join(dirs, ":")}
 
 	if h.Home != "" {
-		env = append(env, "GATE_INBOX_HOME="+shellWord(h.Home))
+		env = append(env, "GATE_INBOX_HOME="+shellPath(h.Home))
 	}
-	if len(env) == 0 {
-		return "exec " + joinShell(words)
+	// During discovery, keep the remote environment until the machine
+	// reports its socket. An explicitly learned empty name means default.
+	if h.TmuxSocket != "" || (h.About != nil && h.About.TmuxSocket != nil) {
+		env = append(env, socketEnv+"="+shellWord(h.TmuxSocket))
 	}
-	return "exec env " + strings.Join(env, " ") + " " + joinShell(words)
+	command := "exec env " + strings.Join(env, " ") + " " + shellPath(program)
+	if len(args) > 0 {
+		command += " " + joinShell(args)
+	}
+	return command
 }
 
 func cutLastSlash(path string) (dir, file string, ok bool) {
@@ -148,17 +169,19 @@ func joinShell(words []string) string {
 // target "=gi_<id>" reached tmux as an error.
 var plainWord = regexp.MustCompile(`^[A-Za-z0-9_@%+:,./-]+$`)
 
-// shellWord quotes s for the shell on the far side of ssh, which joins its
-// arguments into one string for that shell to split again: sh, bash or
-// zsh, whichever the operator logs in with. A leading "~/" is left for
-// that shell to expand, since that is the point of writing it.
-func shellWord(s string) string {
+// shellPath expands a leading ~/ on the machine where the path is used.
+func shellPath(s string) string {
 	if rest, ok := strings.CutPrefix(s, "~/"); ok {
 		if rest == "" {
 			return `"$HOME"/`
 		}
 		return `"$HOME"/` + shellWord(rest)
 	}
+	return shellWord(s)
+}
+
+// shellWord preserves the value through the remote login shell.
+func shellWord(s string) string {
 	if s != "" && plainWord.MatchString(s) {
 		return s
 	}

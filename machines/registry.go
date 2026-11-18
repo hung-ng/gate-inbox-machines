@@ -150,9 +150,9 @@ func (r *registry) readFiles() (filesRead, bool) {
 	changed := false
 	if stamp, moved := r.moved(storeFileName); moved {
 		changed = true
-		var store storeFile
-		switch err := readJSON(filepath.Join(r.dir, storeFileName), &store); {
-		case err == nil, errors.Is(err, os.ErrNotExist):
+		store, err := readStore(filepath.Join(r.dir, storeFileName))
+		switch {
+		case err == nil:
 			read.store = &store
 			none := ""
 			read.problem = &none
@@ -250,6 +250,9 @@ func (r *registry) learn(name, destination string, a about) (bool, error) {
 }
 
 func cleanLearned(learned map[string]learnedEntry) map[string]learnedEntry {
+	if learned == nil {
+		return map[string]learnedEntry{}
+	}
 	for name, entry := range learned {
 		entry.About = entry.About.clean()
 		learned[name] = entry
@@ -268,8 +271,8 @@ func (r *registry) change(edit func(store *storeFile) error) error {
 	}
 	r.io.Lock()
 	err := r.locked(func() error {
-		var store storeFile
-		if err := readJSON(filepath.Join(r.dir, storeFileName), &store); err != nil && !errors.Is(err, os.ErrNotExist) {
+		store, err := readStore(filepath.Join(r.dir, storeFileName))
+		if err != nil {
 			return fmt.Errorf("could not read %s: %w; fix or delete it first", storeFileName, err)
 		}
 		if store.Machines == nil {
@@ -322,9 +325,29 @@ func (r *registry) moved(name string) (fileStamp, bool) {
 		if st, ok := info.Sys().(*syscall.Stat_t); ok {
 			stamp.ino = uint64(st.Ino)
 		}
+	} else if _, err := os.Lstat(filepath.Join(r.dir, name)); !errors.Is(err, os.ErrNotExist) {
+		// Retry unreadable paths, including dangling symlinks.
+		return stamp, true
 	}
 	before, seen := r.stamps[name]
 	return stamp, !seen || before != stamp
+}
+
+func readStore(path string) (storeFile, error) {
+	var store *storeFile
+	err := readJSON(path, &store)
+	if errors.Is(err, os.ErrNotExist) {
+		if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+			return storeFile{}, nil
+		}
+	}
+	if err != nil {
+		return storeFile{}, err
+	}
+	if store == nil {
+		return storeFile{}, errors.New("expected an object in machines.json")
+	}
+	return *store, nil
 }
 
 func readJSON(path string, v any) error {

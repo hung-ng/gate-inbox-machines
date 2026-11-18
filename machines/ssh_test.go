@@ -1,7 +1,9 @@
 package machines
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -16,8 +18,8 @@ func TestShellWord(t *testing.T) {
 		"two words":           "'two words'",
 		"it's":                `'it'\''s'`,
 		"$(rm -rf ~)":         "'$(rm -rf ~)'",
-		"~/go/bin/gate-inbox": `"$HOME"/go/bin/gate-inbox`,
-		"~/my dir/x":          `"$HOME"/'my dir/x'`,
+		"~/go/bin/gate-inbox": "'~/go/bin/gate-inbox'",
+		"~/my dir/x":          "'~/my dir/x'",
 		"~":                   "'~'",
 		"a;b":                 "'a;b'",
 	} {
@@ -93,7 +95,7 @@ func TestListArgvWithHome(t *testing.T) {
 func TestListArgvPutsTmuxOnPath(t *testing.T) {
 	h := host{Name: "mini", Destination: "mini", GateInbox: "/Users/me/go/bin/gate-inbox", Tmux: "/opt/homebrew/bin/tmux", TmuxSocket: "agents"}
 	got := listArgv(testConfig(), h)
-	want := `exec env PATH=/opt/homebrew/bin:/Users/me/go/bin:"$PATH":"$HOME"/go/bin:"$HOME"/.local/bin:/opt/homebrew/bin:/usr/local/bin /Users/me/go/bin/gate-inbox machines sessions --json --tmux /opt/homebrew/bin/tmux --tmux-socket agents`
+	want := `exec env PATH=/opt/homebrew/bin:/Users/me/go/bin:"$PATH":"$HOME"/go/bin:"$HOME"/.local/bin:/opt/homebrew/bin:/usr/local/bin GATE_INBOX_TMUX_SOCKET=agents /Users/me/go/bin/gate-inbox machines sessions --json --tmux /opt/homebrew/bin/tmux --tmux-socket agents`
 	if last := got[len(got)-1]; last != want {
 		t.Errorf("command on the machine = %s\nwant                    %s", last, want)
 	}
@@ -111,7 +113,7 @@ func TestAttachArgv(t *testing.T) {
 	want := []string{
 		"ssh", "-t",
 		"-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-		"--", "mini", "exec /opt/homebrew/bin/tmux -u -L agents attach-session -t '=gi_ab12'",
+		"-o", "ControlPath=none", "--", "mini", "exec /opt/homebrew/bin/tmux -u -L agents attach-session -t '=gi_ab12'",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("attachArgv =\n%q\nwant\n%q", got, want)
@@ -124,5 +126,40 @@ func TestOperatorSSHOptionsComeFirst(t *testing.T) {
 	got := listArgv(cfg, host{Name: "mini", Destination: "mini", GateInbox: "gate-inbox"})
 	if strings.Join(got[:3], " ") != "/usr/bin/ssh -F /home/me/.ssh/agents" {
 		t.Errorf("argv starts %q", got[:3])
+	}
+}
+
+func TestMachinePathPrecedence(t *testing.T) {
+	h := host{Tmux: "/chosen/tmux/tmux", GateInbox: "~/chosen/gate-inbox"}
+	cmd := exec.Command("sh", "-c", machineCommand(h, "sh", "-c", `printf '%s' "$PATH"`))
+	cmd.Env = []string{"HOME=/far/home", "PATH=/usr/bin:/bin"}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "/chosen/tmux:/far/home/chosen:/usr/bin:/bin:/far/home/go/bin:/far/home/.local/bin:/opt/homebrew/bin:/usr/local/bin"
+	if string(out) != want {
+		t.Fatalf("%s want %s", out, want)
+	}
+}
+
+func TestEnsureControlDirRequiresPrivateRealDirectory(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "control")
+	if err := ensureControlDir(filepath.Join(dir, "%C")); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureControlDir(filepath.Join(link, "%C")); err == nil {
+		t.Fatal("accepted control directory symlink")
+	}
+	if err := os.Chmod(dir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureControlDir(filepath.Join(dir, "%C")); err == nil {
+		t.Fatal("accepted a control directory accessible to the group")
 	}
 }
