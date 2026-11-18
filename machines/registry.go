@@ -56,10 +56,17 @@ type learnedEntry struct {
 // read it, so it is safe for concurrent use, and it reads its files again
 // when they change on disk.
 type registry struct {
+	// io serializes this process's reads and writes of the files, and
+	// guards stamps. It is never held while mu is wanted by a caller that
+	// only reads: the board draws the machines screen from all(), on its
+	// event loop, so a frame must not wait on a disk or on another
+	// process's lock.
+	io     sync.Mutex
+	stamps map[string]fileStamp
+
 	mu      sync.Mutex
 	base    []host
 	dir     string
-	stamps  map[string]fileStamp
 	store   storeFile
 	learned map[string]learnedEntry
 	hosts   []host
@@ -73,8 +80,8 @@ type registry struct {
 // what a test or a host without a data dir gets.
 func newRegistry(base []host, dir string) *registry {
 	r := &registry{base: base, dir: dir, stamps: map[string]fileStamp{}, learned: map[string]learnedEntry{}}
+	r.reload()
 	r.mu.Lock()
-	r.readLocked()
 	r.buildLocked()
 	r.mu.Unlock()
 	return r
@@ -112,11 +119,23 @@ func (r *registry) issue() string {
 // reload reads the files again if they changed since the last read, and
 // says whether the machines did.
 func (r *registry) reload() bool {
+	r.io.Lock()
+	defer r.io.Unlock()
+	read, ok := r.readFiles()
+	if !ok {
+		return false
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	before := r.hosts
-	if !r.readLocked() {
-		return false
+	if read.store != nil {
+		r.store = *read.store
+	}
+	if read.problem != nil {
+		r.problem = *read.problem
+	}
+	if read.learned != nil {
+		r.learned = read.learned
 	}
 	r.buildLocked()
 	return !slices.EqualFunc(before, r.hosts, sameHost)
@@ -130,10 +149,19 @@ func sameHost(a, b host) bool {
 	return a == b
 }
 
-// readLocked reads each file whose stamp moved, and says whether any did.
-func (r *registry) readLocked() bool {
+// filesRead is what readFiles found: nil for each part that didn't move.
+type filesRead struct {
+	store   *storeFile
+	problem *string
+	learned map[string]learnedEntry
+}
+
+// readFiles reads each file whose stamp moved, holding io, and says
+// whether any did.
+func (r *registry) readFiles() (filesRead, bool) {
+	var read filesRead
 	if r.dir == "" {
-		return false
+		return read, false
 	}
 	changed := false
 	if stamp, moved := r.moved(storeFileName); moved {
@@ -141,12 +169,14 @@ func (r *registry) readLocked() bool {
 		var store storeFile
 		switch err := readJSON(filepath.Join(r.dir, storeFileName), &store); {
 		case err == nil, errors.Is(err, os.ErrNotExist):
-			r.store = store
-			r.problem = ""
+			read.store = &store
+			none := ""
+			read.problem = &none
 		default:
 			// The last good list stands, so a file caught mid-edit by hand
 			// does not take every added machine off the board.
-			r.problem = fmt.Sprintf("could not read %s: %v", storeFileName, err)
+			problem := fmt.Sprintf("could not read %s: %v", storeFileName, err)
+			read.problem = &problem
 		}
 		r.stamps[storeFileName] = stamp
 	}
@@ -155,16 +185,16 @@ func (r *registry) readLocked() bool {
 		learned := map[string]learnedEntry{}
 		switch err := readJSON(filepath.Join(r.dir, learnedFileName), &learned); {
 		case err == nil:
-			r.learned = cleanLearned(learned)
+			read.learned = cleanLearned(learned)
 		case errors.Is(err, os.ErrNotExist):
-			r.learned = map[string]learnedEntry{}
+			read.learned = map[string]learnedEntry{}
 		}
 		r.stamps[learnedFileName] = stamp
 	}
-	return changed
+	return read, changed
 }
 
-// buildLocked lays the machines out from what was read.
+// buildLocked lays the machines out from what was read, holding mu.
 func (r *registry) buildLocked() {
 	paused := map[string]bool{}
 	for _, name := range r.store.Paused {
@@ -214,15 +244,18 @@ func (r *registry) buildLocked() {
 // changed anything. It is saved for the other processes of this build.
 func (r *registry) learn(name, destination string, a about) (bool, error) {
 	a = a.clean()
-	// Held through the write, so two machines learned at once can't each
-	// leave the other's entry out of what this process keeps.
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	entry, ok := r.learned[name]
+	r.mu.Unlock()
 	if ok && entry.Destination == destination && entry.About.equal(a) {
 		return false, nil
 	}
 	entry = learnedEntry{Destination: destination, About: a, At: time.Now().UTC()}
+	// io makes this process's learns take turns, so two machines learned
+	// at once can't each leave the other's entry out; the file lock does
+	// the same for other processes.
+	r.io.Lock()
+	defer r.io.Unlock()
 	var merged map[string]learnedEntry
 	var err error
 	if r.dir != "" {
@@ -238,10 +271,14 @@ func (r *registry) learn(name, destination string, a about) (bool, error) {
 			merged[name] = entry
 			return writeJSON(filepath.Join(r.dir, learnedFileName), merged)
 		})
+		if err == nil {
+			r.stamps[learnedFileName], _ = r.moved(learnedFileName)
+		}
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if err == nil && merged != nil {
 		r.learned = merged
-		r.stamps[learnedFileName], _ = r.moved(learnedFileName)
 	} else {
 		r.learned[name] = entry
 	}
@@ -267,6 +304,7 @@ func (r *registry) change(edit func(store *storeFile, base []host) error) error 
 	if r.dir == "" {
 		return errNoStore
 	}
+	r.io.Lock()
 	err := r.locked(func() error {
 		var store storeFile
 		if err := readJSON(filepath.Join(r.dir, storeFileName), &store); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -282,6 +320,7 @@ func (r *registry) change(edit func(store *storeFile, base []host) error) error 
 		store.Paused = slices.Compact(store.Paused)
 		return writeJSON(filepath.Join(r.dir, storeFileName), store)
 	})
+	r.io.Unlock()
 	if err != nil {
 		return err
 	}

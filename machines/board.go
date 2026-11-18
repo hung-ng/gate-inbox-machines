@@ -86,6 +86,9 @@ type mirrors struct {
 	// status is where each pass leaves every machine's state, for the
 	// machines screen.
 	status *statusBoard
+	// lastIssue is the machines file problem last logged, so it is logged
+	// when it changes rather than every pass.
+	lastIssue string
 }
 
 // stateFile is the mirrors' saved state, in the extension's data dir.
@@ -130,11 +133,11 @@ func (m *mirrors) pass(ctx context.Context) {
 	if m.reg.reload() {
 		m.log.Info("the machines changed on disk", "machines", len(m.reg.all()))
 	}
-	if issue := m.reg.issue(); issue != m.lastErr[""] {
+	if issue := m.reg.issue(); issue != m.lastIssue {
 		if issue != "" {
 			m.log.Warn("some added machines can't be used", "err", issue)
 		}
-		m.lastErr[""] = issue
+		m.lastIssue = issue
 	}
 	hosts := m.reg.active()
 	observed := m.observe(ctx, hosts)

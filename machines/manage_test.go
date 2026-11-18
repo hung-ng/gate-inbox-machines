@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -704,9 +705,11 @@ func TestMachinesScreen(t *testing.T) {
 	if !strings.Contains(body, "devbox  not checked") {
 		t.Fatal(body)
 	}
-	// Space pauses mini; the screen reads the store again.
+	// Space pauses mini, off the event loop; the screen reads the store
+	// again.
 	v.Key(extension.ViewKey{Action: actionPause, Key: "space"})
-	if h, _ := e.machines().host("mini"); !h.Paused || !strings.Contains(text(v.Render(120, 40)), "mini  paused") {
+	waitFor(t, "the pause", func() bool { return strings.Contains(text(v.Render(120, 40)), "mini  paused") })
+	if h, _ := e.machines().host("mini"); !h.Paused {
 		t.Fatal(text(v.Render(120, 40)))
 	}
 	// Enter on a suggestion opens the add form with it filled in.
@@ -736,9 +739,7 @@ func TestMachinesScreenRemovesOnTheSecondPress(t *testing.T) {
 		t.Fatal(text(v.Render(120, 40)))
 	}
 	v.Key(extension.ViewKey{Action: actionRemove, Key: "d"})
-	if len(e.machines().all()) != 0 {
-		t.Fatal("not removed")
-	}
+	waitFor(t, "the removal", func() bool { return len(e.machines().all()) == 0 })
 	if !strings.Contains(text(v.Render(120, 40)), "No machines yet") {
 		t.Fatal(text(v.Render(120, 40)))
 	}
@@ -759,21 +760,24 @@ func TestAddFormAddsOrOpensASetupRow(t *testing.T) {
 	values := map[string]string{"destination": "me@box", "name": "", "group": ""}
 	f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: values})
 	waitFor(t, "the key problem", func() bool { return strings.Contains(text(f.Render(120, 40)), "ctrl+f") })
-	if !f.Key(extension.ViewKey{Action: actionFix, Key: "ctrl+f", Values: values}) {
-		t.Fatal("the fix did not close the form")
+	// Launching waits on the board, so the key returns at once and the
+	// form closes itself once the row is there.
+	if f.Key(extension.ViewKey{Action: actionFix, Key: "ctrl+f", Values: values}) {
+		t.Fatal("the key waited for the launch")
 	}
-	if len(b.launches) != 1 {
-		t.Fatal(b.launches)
+	waitFor(t, "the setup row", func() bool { u.mu.Lock(); defer u.mu.Unlock(); return u.closed == 1 })
+	launches := b.launched()
+	if len(launches) != 1 {
+		t.Fatal(launches)
 	}
-	req := b.launches[0]
+	req := launches[0]
 	if req.Role != setupRoleName || req.Tool != toolName || strings.Join(req.Args, " ") != "--add -- me@box" || req.Name != "add-box" {
 		t.Fatalf("%+v", req)
 	}
 	if !slices.Contains(b.pins, "l1=waiting") {
 		t.Fatal(b.pins)
 	}
-	// The form handed the operator a row; closing it leaves them there.
-	f.Closed(extension.CloseReturned)
+	// The form handed the operator a row; closing it left them there.
 	if screen, _ := u.last(); screen != addScreen {
 		t.Fatal("reopened the machines screen over the setup row")
 	}
@@ -1076,8 +1080,176 @@ func TestAddFormPassesPathAndHomeToItsSetupRow(t *testing.T) {
 	f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: values})
 	waitFor(t, "the key problem", func() bool { return strings.Contains(text(f.Render(120, 40)), "ctrl+f") })
 	f.Key(extension.ViewKey{Action: actionFix, Key: "ctrl+f", Values: values})
-	if len(b.launches) != 1 || strings.Join(b.launches[0].Args, " ") != "--add --home ~/review/board --gate-inbox ~/review/bin/gate-inbox-machines -- box" {
-		t.Fatal(b.launches)
+	waitFor(t, "the setup row", func() bool { return len(b.launched()) == 1 })
+	if args := strings.Join(b.launched()[0].Args, " "); args != "--add --home ~/review/board --gate-inbox ~/review/bin/gate-inbox-machines -- box" {
+		t.Fatal(args)
+	}
+}
+
+func (b *fakeBoard) launched() []extension.LaunchRequest {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.launches)
+}
+
+// A machine on the board whose check fails on its key gets f, which opens
+// a setup row that fixes it rather than adding it again.
+func TestMachinesScreenOffersAFixPaneAfterACheck(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	far := healthyFar()
+	e := newManaged(t, far, mini)
+	b := newFakeBoard()
+	e.board = b
+	u := &screenUI{}
+	e.ui = u
+	far.setErr(errors.New("exit status 255: Permission denied (publickey)."))
+	e.openMachines(context.Background())
+	_, view := u.last()
+	v := view.(*machinesView)
+	v.Key(extension.ViewKey{Action: actionCheck, Key: "c"})
+	waitFor(t, "the check", func() bool { return strings.Contains(text(v.Render(120, 40)), "Press f to fix it") })
+	v.Key(extension.ViewKey{Action: actionFix, Key: "f"})
+	waitFor(t, "the fix row", func() bool { return len(b.launched()) == 1 })
+	req := b.launched()[0]
+	if req.Role != setupRoleName || req.Name != "fix-mini" || strings.Join(req.Args, " ") != "--add --fix -- mini" {
+		t.Fatalf("%+v", req)
+	}
+	waitFor(t, "the screen to close", func() bool { u.mu.Lock(); defer u.mu.Unlock(); return u.closed == 1 })
+}
+
+// The fix pane checks the machine, runs the fix once the operator agrees,
+// and checks again, without adding anything.
+func TestFixPaneFixesAMachineOnTheBoard(t *testing.T) {
+	far := healthyFar()
+	far.setErr(errors.New("exit status 255: Permission denied (publickey)."))
+	e := newManaged(t, far, mini)
+	var ran []string
+	e.attach = func(_ context.Context, argv []string) (int, error) {
+		ran = argv
+		far.setErr(nil)
+		return 0, nil
+	}
+	stdin, stdout := os.Stdin, os.Stdout
+	in, feed, _ := os.Pipe()
+	out, err := os.CreateTemp(t.TempDir(), "pane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin, os.Stdout = in, out
+	t.Cleanup(func() { os.Stdin, os.Stdout = stdin, stdout })
+	feed.WriteString("y\n\n")
+	feed.Close()
+	t.Setenv("GATE_INBOX_SESSION_ID", "abcd")
+	err = e.runAttach(context.Background(), []string{"", setupFlag, fixFlag, "--", "mini"}, nil)
+	os.Stdin, os.Stdout = stdin, stdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, _ := os.ReadFile(out.Name())
+	if strings.Join(ran, " ") != "ssh-copy-id mini" || !strings.Contains(string(pane), "Every check passed.") {
+		t.Fatalf("%v\n%s", ran, pane)
+	}
+	if len(e.machines().all()) != 1 || !setupDone(e.machines().dir, "abcd") {
+		t.Fatal(e.machines().all())
+	}
+}
+
+func TestAddTheSameDestinationWithAnotherHomeIsASecondBoard(t *testing.T) {
+	far := healthyFar()
+	e := newManaged(t, far)
+	var out bytes.Buffer
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box", Home: "~/one"}, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "box"}, &out, nil)
+	if err == nil || !strings.Contains(err.Error(), "already on this board as box with board home ~/one") {
+		t.Fatal(err)
+	}
+	far.snap.About.Hostname = "other-board.local"
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "box2", Home: "~/two"}, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box", Home: "~/two"}, &out, nil); err == nil {
+		t.Fatal("the same board was added twice")
+	}
+}
+
+func TestCheckSaysWhenEveryMachineIsPaused(t *testing.T) {
+	e := newManaged(t, healthyFar(), mini)
+	if err := e.pauseMachine("mini", true); err != nil {
+		t.Fatal(err)
+	}
+	err := e.runCheck(context.Background(), nil, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "every machine is paused") {
+		t.Fatal(err)
+	}
+	if err := e.runCheck(context.Background(), []string{"mini"}, &bytes.Buffer{}); err != nil {
+		t.Fatal("a paused machine named outright is checked:", err)
+	}
+}
+
+func TestMachineStatusShowsTheVersion(t *testing.T) {
+	e := newManaged(t, healthyFar())
+	e.status.set(map[string]machineState{"box": {BoardRunning: true}})
+	h := host{Name: "box", About: &about{Version: Version}}
+	if status, _ := e.machineStatus(h); !strings.Contains(status, "machines "+Version) {
+		t.Fatal(status)
+	}
+	h.About.Version = "0.0.1"
+	if status, tone := e.machineStatus(h); !strings.Contains(status, "machines 0.0.1, this one "+Version) || tone != extension.ToneWarn {
+		t.Fatal(status, tone)
+	}
+}
+
+// Drawing the machines screen reads the registry on the board's event
+// loop, so it must not wait while another process holds the machines
+// file's lock.
+func TestRegistryReadsDontWaitOnTheFileLock(t *testing.T) {
+	dir := t.TempDir()
+	r := newRegistry(nil, dir)
+	lock, err := os.OpenFile(filepath.Join(dir, lockFileName), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	learned := make(chan struct{})
+	go func() {
+		r.learn("box", "box", about{Hostname: "box"})
+		close(learned)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	read := make(chan struct{})
+	go func() {
+		r.all()
+		r.issue()
+		close(read)
+	}()
+	select {
+	case <-read:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reading the registry waited on the file lock")
+	}
+	syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	<-learned
+}
+
+func TestAddFormDoesNotReopenTheScreenOverAViewThatReplacedIt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	e := newManaged(t, healthyFar())
+	u := &screenUI{}
+	e.ui = u
+	e.openAdd(context.Background(), "")
+	_, view := u.last()
+	view.(*addForm).Closed(extension.CloseReplaced)
+	if screen, _ := u.last(); screen != addScreen {
+		t.Fatal("reopened the machines screen over the view that replaced the form")
+	}
+	view.(*addForm).Closed(extension.CloseDismissed)
+	if screen, _ := u.last(); screen != machinesScreen {
+		t.Fatal(screen)
 	}
 }
 

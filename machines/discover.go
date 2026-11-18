@@ -182,7 +182,6 @@ func (e *Extension) suggestions(ctx context.Context) ([]suggestion, string) {
 	hostnames := map[string]bool{}
 	for _, h := range machines {
 		known[h.Destination] = true
-		known[h.Name] = true
 		// An alias in ~/.ssh/config often names a machine already on the
 		// board under another destination.
 		if target, ok := e.sshTarget(ctx, h.Destination); ok {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -88,9 +89,10 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 		return host{}, errNoStore
 	}
 	existing := reg.all()
+	opts.Home = strings.TrimSpace(opts.Home)
 	for _, h := range existing {
-		if h.Destination == opts.Destination {
-			return host{}, fmt.Errorf("%s is already on this board as %s", opts.Destination, h.Name)
+		if h.Destination == opts.Destination && sameBoard(h, opts.Home) {
+			return host{}, fmt.Errorf("%s is already on this board as %s%s", opts.Destination, h.Name, otherBoardHint(h))
 		}
 		if opts.Name != "" && h.Name == opts.Name {
 			return host{}, fmt.Errorf("a machine named %s is already on this board", opts.Name)
@@ -102,7 +104,6 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 		}
 	}
 	opts.GateInbox = strings.TrimSpace(opts.GateInbox)
-	opts.Home = strings.TrimSpace(opts.Home)
 	if opts.GateInbox != "" && !strings.HasPrefix(opts.GateInbox, "/") && !strings.HasPrefix(opts.GateInbox, "~/") {
 		return host{}, fmt.Errorf("gate-inbox path %q must be a full path, or start with ~/", opts.GateInbox)
 	}
@@ -176,7 +177,7 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 			return fmt.Errorf("a machine named %s is already on this board", name)
 		}
 		for other, s := range store.Machines {
-			if s.Destination == opts.Destination {
+			if s.Destination == opts.Destination && (opts.Home == "" || s.Home == opts.Home) {
 				return fmt.Errorf("%s is already on this board as %s", opts.Destination, other)
 			}
 		}
@@ -224,7 +225,7 @@ func forAdding(result probeResult) probeResult {
 		case step.Name == "board running":
 			result.Steps[i].Fix = "start that machine's board; if it runs with GATE_INBOX_HOME, give that as the board home (--home)"
 		case step.Name == "attachable session":
-			result.Steps[i].Fix = "if that board sets tmux_socket, set it for this machine once it is added"
+			result.Steps[i].Fix = notMirroredFix
 		}
 	}
 	return result
@@ -262,13 +263,36 @@ func (e *Extension) fixAtTerminal(ctx context.Context, term *terminal, destinati
 	return true
 }
 
-func (e *Extension) runAdd(ctx context.Context, args []string) error {
-	set := cmdline.NewFlagSet(usageAdd)
+// addFlags declares the flags `machines add` and a setup row's pane take,
+// and returns what reads them back. setupArgs is the other half: the
+// machines screen hands a setup row its options through these flags.
+func addFlags(set *flag.FlagSet) func(destination string) addOptions {
 	name := set.String("name", "", "the machine's name on this board; defaults to its hostname")
 	group := set.String("group", "", "an existing group to file its rows under")
 	home := set.String("home", "", "GATE_INBOX_HOME of the board on that machine, if it uses one")
 	gateInbox := set.String("gate-inbox", "", "this build's full path on that machine, if neither its PATH nor its login shell finds it")
 	force := set.Bool("force", false, "add it even if a check that keeps it from working fails, or it looks like a machine already added")
+	return func(destination string) addOptions {
+		return addOptions{Destination: destination, Name: *name, Group: *group, Home: *home, GateInbox: *gateInbox, Force: *force}
+	}
+}
+
+// setupArgs is opts as the flags addFlags reads, for a setup row's pane.
+func setupArgs(opts addOptions) []string {
+	var args []string
+	for _, flag := range []struct{ name, value string }{
+		{"--name", opts.Name}, {"--group", opts.Group}, {"--home", opts.Home}, {"--gate-inbox", opts.GateInbox},
+	} {
+		if flag.value != "" {
+			args = append(args, flag.name, flag.value)
+		}
+	}
+	return append(args, "--", strings.TrimSpace(opts.Destination))
+}
+
+func (e *Extension) runAdd(ctx context.Context, args []string) error {
+	set := cmdline.NewFlagSet(usageAdd)
+	options := addFlags(set)
 	operands, err := cmdline.Parse(os.Stdout, program, set, args, 1, 1)
 	if err != nil {
 		return err
@@ -277,7 +301,7 @@ func (e *Extension) runAdd(ctx context.Context, args []string) error {
 	if isTerminal(os.Stdin) {
 		term = &terminal{in: bufio.NewReader(os.Stdin), out: os.Stdout, run: e.attach}
 	}
-	h, err := e.addMachine(ctx, addOptions{Destination: operands[0], Name: *name, Group: *group, Home: *home, GateInbox: *gateInbox, Force: *force}, os.Stdout, term)
+	h, err := e.addMachine(ctx, options(operands[0]), os.Stdout, term)
 	if err != nil {
 		var needs errNeedsTerminal
 		if errors.As(err, &needs) {
@@ -290,35 +314,47 @@ func (e *Extension) runAdd(ctx context.Context, args []string) error {
 }
 
 // setupFlag leads a setup row's arguments to `machines attach`, which is
-// what the mirror tool block runs.
-const setupFlag = "--add"
+// what the mirror tool block runs. fixFlag after it makes the row fix a
+// machine already on the board rather than add one.
+const (
+	setupFlag = "--add"
+	fixFlag   = "--fix"
+)
 
 const (
 	setupRoleName = "setup"
 	setupRole     = extensionID + "/" + setupRoleName
 )
 
-// runSetupPane is `machines add` in a setup row's pane, which the machines
-// screen opens for a machine whose ssh setup needs the operator to type.
-// It waits for Enter before it ends, so the result stays on screen.
+// runSetupPane runs in a setup row's pane, which the machines screen opens
+// for a machine whose ssh setup needs the operator to type: `machines add`
+// for a new one, or a check with its fix for one already on the board. It
+// waits for Enter before it ends, so the result stays on screen.
 func (e *Extension) runSetupPane(ctx context.Context, args []string, caller string) error {
-	set := cmdline.NewFlagSet(usageAdd)
-	name := set.String("name", "", "")
-	group := set.String("group", "", "")
-	home := set.String("home", "", "")
-	gateInbox := set.String("gate-inbox", "", "")
-	operands, err := cmdline.Parse(os.Stdout, program, set, args, 1, 1)
-	if err != nil {
-		return err
-	}
 	in := bufio.NewReader(os.Stdin)
 	term := &terminal{in: in, out: os.Stdout, run: e.attach}
-	fmt.Printf("Adding %s to this board.\n\n", operands[0])
-	h, err := e.addMachine(ctx, addOptions{Destination: operands[0], Name: *name, Group: *group, Home: *home, GateInbox: *gateInbox}, os.Stdout, term)
-	if err != nil {
-		fmt.Printf("\n%v\n", err)
+	if len(args) > 0 && args[0] == fixFlag {
+		set := cmdline.NewFlagSet(usageCheck)
+		operands, err := cmdline.Parse(os.Stdout, program, set, args[1:], 1, 1)
+		if err != nil {
+			return err
+		}
+		e.fixMachine(ctx, operands[0], term)
 	} else {
-		fmt.Printf("\nAdded %s (%s). Its sessions show on the board within a few seconds.\n", h.Name, h.Destination)
+		set := cmdline.NewFlagSet(usageAdd)
+		options := addFlags(set)
+		operands, err := cmdline.Parse(os.Stdout, program, set, args, 1, 1)
+		if err != nil {
+			return err
+		}
+		opts := options(operands[0])
+		fmt.Printf("Adding %s to this board.\n\n", opts.Destination)
+		h, err := e.addMachine(ctx, opts, os.Stdout, term)
+		if err != nil {
+			fmt.Printf("\n%v\n", err)
+		} else {
+			fmt.Printf("\nAdded %s (%s). Its sessions show on the board within a few seconds.\n", h.Name, h.Destination)
+		}
 	}
 	fmt.Print("\nPress Enter to close this row.")
 	_, _ = in.ReadString('\n')
@@ -330,6 +366,40 @@ func (e *Extension) runSetupPane(ctx context.Context, args []string, caller stri
 		}
 	}
 	return nil
+}
+
+// fixMachine checks a machine already on the board at the operator's
+// terminal, runs the fix a failed ssh step needs once they agree, and
+// checks again.
+func (e *Extension) fixMachine(ctx context.Context, name string, term *terminal) {
+	reg := e.machines()
+	h, ok := reg.host(name)
+	if !ok {
+		fmt.Fprintf(term.out, "no machine %q on this board\n", name)
+		return
+	}
+	if err := ensureControlDir(e.cfg.ControlPath); err != nil {
+		fmt.Fprintln(term.out, err)
+		return
+	}
+	fmt.Fprintf(term.out, "Checking %s (%s).\n\n", h.Name, h.Destination)
+	var result probeResult
+	for tries := 0; ; tries++ {
+		result = e.probe(ctx, h)
+		result.print(term.out, h.Name)
+		blocked := result.blocking()
+		if blocked == nil || blocked.Fixable == "" || tries == 2 || !e.fixAtTerminal(ctx, term, h.Destination, blocked.Fixable) {
+			break
+		}
+	}
+	if result.Snapshot != nil && result.Snapshot.About != nil {
+		_, _ = reg.learn(h.Name, h.Destination, *result.Snapshot.About)
+	}
+	if result.failed() {
+		fmt.Fprintf(term.out, "\n%s still fails a check; the step above says what to change.\n", h.Name)
+		return
+	}
+	fmt.Fprintf(term.out, "\nEvery check passed. The board picks %s up on its next poll.\n", h.Name)
 }
 
 // setupDoneDir holds a file for each setup row whose pane has finished.

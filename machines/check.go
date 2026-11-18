@@ -32,6 +32,9 @@ func (e *Extension) runCheck(ctx context.Context, names []string, out io.Writer)
 		}
 	}
 	if len(hosts) == 0 {
+		if len(reg.all()) > 0 {
+			return errors.New("every machine is paused: name one to check it, or resume it with `gate-inbox machines resume`")
+		}
 		return errors.New("no machines configured: add one with `gate-inbox machines add <destination>`")
 	}
 	if err := ensureControlDir(e.cfg.ControlPath); err != nil {
@@ -226,6 +229,9 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 		fix := "check that gate-inbox runs on that machine"
 		if notFound(err) {
 			fix = "set gate_inbox to its full path"
+			if h.Source == sourceAdded {
+				fix = "remove it and add it again with --gate-inbox, giving this build's full path there"
+			}
 			if h.Settings.GateInbox == "" {
 				// An installer often puts it on a PATH only the login
 				// files set.
@@ -289,7 +295,13 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 				return result
 			}
 		}
-		step(checkStep{Name: "attachable session", Soft: true, Err: errors.New("no attachable sessions"), Fix: "set tmux_socket to match that board's config"})
+		fix := "set tmux_socket to match that board's config"
+		if h.About != nil && h.About.TmuxSocket != nil {
+			// The machine said which server its board uses, and it was
+			// asked about that one.
+			fix = notMirroredFix
+		}
+		step(checkStep{Name: "attachable session", Soft: true, Err: errors.New("no attachable sessions"), Fix: fix})
 	}
 	return result
 }
@@ -301,6 +313,10 @@ func (e *Extension) listOnce(ctx context.Context, h host) (snapshot, error) {
 	}
 	return parseSnapshot(bytes.NewReader(data))
 }
+
+// notMirroredFix explains running sessions with nothing to attach to on
+// the tmux server the machine's own board reports using.
+const notMirroredFix = "its running sessions have no gi_ tmux session there, as with panes its board adopted, so they aren't mirrored; bring one into that board with ctrl+alt+a to mirror it"
 
 // findThroughLogin is where the machine's login shell finds program, or
 // "" when it finds none.

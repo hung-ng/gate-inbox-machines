@@ -70,26 +70,27 @@ seconds, with no restart.
 When SSH can't log in without a prompt, `machines add` at a terminal offers the fix and checks
 again:
 
-- no key on that machine: it runs `ssh-copy-id <destination>`, and you type that machine's
-  password once
-- an unknown host key: it connects once without `BatchMode`, so you can check the fingerprint and
-  accept it
+- With no key on that machine, it runs `ssh-copy-id <destination>`, and you type that machine's
+  password once.
+- With an unknown host key, it connects once without `BatchMode`, so you can check the fingerprint
+  and accept it.
 
-On the machines screen, the same problems offer `ctrl+f`, which opens a setup row on the board
-running `machines add` in a pane. Its status is waiting, so triage hands it to you. Open it, type
-what it asks, and press Enter when it's done. The row is archived once its pane ends.
+On the machines screen, the add form offers `ctrl+f` for the same problems. It opens a setup row on
+the board, running `machines add` in a pane. Its status is waiting, so triage hands it to you.
+Open it, type what it asks, and press Enter when it's done. The board archives the row once its
+pane ends. A machine already on the board that later fails a check (`c`) the same way gets `f`,
+which opens a setup row that runs the fix and checks it again.
 
 The name defaults to the first part of the hostname the machine reports, such as `box-1` for
 `Box-1.local`. `--name` sets your own. Names are lower case letters, digits, `-` and `_`, and start
 with a letter. Each row's name starts with it, such as `box-1-upgrade-http-client`, so a short one
 reads better.
 
-Two optional settings cover a machine set up some other way:
-
-- **gate-inbox path** (`--gate-inbox`): this build's full path there, when its PATH and login shell
-  don't find it, such as a build kept under another name in a folder of its own
-- **board home** (`--home`): `GATE_INBOX_HOME` of that machine's board, when it uses one. Without
-  it, the check reads the machine's default home, and reports its board as stopped.
+Two optional settings cover a machine set up some other way. The add form's gate-inbox path field,
+or `--gate-inbox`, takes this build's full path there, for when its PATH and login shell don't find
+it, such as a build kept under another name in a folder of its own. The board home field, or
+`--home`, takes `GATE_INBOX_HOME` of that machine's board, when it uses one. Without it, the check
+reads the machine's default home and reports its board as stopped.
 
 Adding refuses a machine that's already on the board under another name:
 
@@ -102,7 +103,8 @@ One host can run two boards, each on its own home. Giving a different board home
 one. With no board home given, adding takes it to mean the board already there. `--force` adds it
 anyway.
 
-Adding a machine changes nothing on that machine. SSH must already be on there: on a Mac, Remote
+Adding a machine changes nothing on that machine, apart from the key `ssh-copy-id` installs when
+you agree to it. SSH must already be on there: on a Mac, Remote
 Login under System Settings → General → Sharing, and on Linux, the `sshd` service.
 
 ### What each machine reports
@@ -135,18 +137,19 @@ stopped, offline since a time and why, or paused. Under it are suggestions to ad
 | `a` | Add a machine. On a suggestion, the form starts with its destination |
 | `enter` | Check the machine under the cursor, or add the suggestion |
 | `c` | Check the machine and show each step |
-| `space` | Pause or resume. A paused machine isn't polled, and its mirrors are put away until it resumes |
-| `d` | Remove, after a second `d`. Its mirrors are put away. Its agents keep running |
+| `space` | Pause or resume. The board stops polling a paused machine and puts its mirrors away until it resumes |
+| `d` | Remove, after a second `d`. The board puts its mirrors away, and its agents keep running |
 | `s` | Start its board (see below) |
 | `n` | Start a session there, as `N` on the list does |
-| `r` | Rename. Its mirrors come back under the new name |
+| `r` | Rename. The board brings its mirrors back under the new name |
+| `f` | After a check that failed on a missing key or an unknown host key, open a setup row that fixes it |
 | `esc`, `q` | Close |
 
 From a shell:
 
 ```bash
 gate-inbox machines list                # every machine, where it's written, and what it reported
-gate-inbox machines check               # walk every machine through the steps above
+gate-inbox machines check               # walk every machine that isn't paused through the steps above
 gate-inbox machines check mini          # just one
 gate-inbox machines pause mini
 gate-inbox machines resume mini
