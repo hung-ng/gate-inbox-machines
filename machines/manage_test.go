@@ -29,6 +29,8 @@ type farMachine struct {
 	// hidden is a gate-inbox only the login shell finds, at loginPath.
 	hidden    bool
 	loginPath string
+	// targets is what `ssh -G` resolves each destination to.
+	targets map[string]string
 }
 
 func healthyFar() *farMachine {
@@ -42,6 +44,12 @@ func healthyFar() *farMachine {
 func (f *farMachine) run(_ context.Context, argv []string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if slices.Contains(argv, "-G") {
+		if target, ok := f.targets[argv[len(argv)-1]]; ok {
+			return []byte(target), nil
+		}
+		return nil, errors.New("no ssh config")
+	}
 	cmd := argv[len(argv)-1]
 	f.calls = append(f.calls, cmd)
 	if f.sshErr != nil {
@@ -910,5 +918,165 @@ func TestNWithNoMachinesOpensTheMachinesScreen(t *testing.T) {
 	keys[0].Run(context.Background(), extension.Press{})
 	if screen, view := u.last(); screen != spawnScreen || view.(*spawnForm).machine != "box-1" {
 		t.Fatal(screen)
+	}
+}
+
+func resolved(user, hostname, port string) string {
+	return "user " + user + "\nhostname " + hostname + "\nport " + port + "\nbatchmode no\n"
+}
+
+func TestSSHTargetReadsWhatSSHWouldConnectTo(t *testing.T) {
+	far := healthyFar()
+	far.targets = map[string]string{"alias": resolved("me", "Mini.Example.COM.", "22")}
+	e := newManaged(t, far)
+	if target, ok := e.sshTarget(context.Background(), "alias"); !ok || target != "me@mini.example.com:22" {
+		t.Fatal(target, ok)
+	}
+	if _, ok := e.sshTarget(context.Background(), "unknown"); ok {
+		t.Fatal("a destination ssh -G refused has a target")
+	}
+	if _, ok := e.sshTarget(context.Background(), "-oProxyCommand=x"); ok {
+		t.Fatal("an option was passed as a destination")
+	}
+}
+
+// An alias in ~/.ssh/config for a machine already on the board is not
+// offered again, nor is a discovered machine that reports its hostname.
+func TestSuggestionsLeaveOutMachinesAlreadyOnTheBoard(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte("Host mini-alias devbox\n"), 0o600)
+	far := healthyFar()
+	far.snap.About.Hostname = "hung-mini"
+	far.targets = map[string]string{
+		"mini.example.com": resolved("me", "mini.example.com", "22"),
+		"mini-alias":       resolved("me", "mini.example.com", "22"),
+		"devbox":           resolved("me", "devbox.example.com", "22"),
+		"10.0.0.7":         resolved("me", "10.0.0.7", "22"),
+	}
+	mini := host{Name: "mini", Destination: "mini.example.com", GateInbox: "gate-inbox", Tmux: "tmux"}
+	e := newManaged(t, far, mini)
+	e.reg.learn("mini", "mini.example.com", about{Hostname: "hung-mini"})
+	e.cfg.Discover = []string{"sh", "-c", "printf '10.0.0.7\\n'"}
+	found, problem := e.suggestions(context.Background())
+	var got []string
+	for _, s := range found {
+		got = append(got, s.Destination)
+	}
+	if problem != "" || strings.Join(got, ",") != "devbox" {
+		t.Fatal(got, problem)
+	}
+}
+
+func TestAddRefusesAnotherNameForAMachineOnTheBoard(t *testing.T) {
+	far := healthyFar()
+	far.targets = map[string]string{
+		"mini.example.com": resolved("me", "mini.example.com", "22"),
+		"mini-alias":       resolved("me", "mini.example.com", "22"),
+	}
+	mini := host{Name: "mini", Destination: "mini.example.com", GateInbox: "gate-inbox", Tmux: "tmux"}
+	e := newManaged(t, far, mini)
+	var out bytes.Buffer
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias"}, &out, nil)
+	if err == nil || !strings.Contains(err.Error(), "reaches the same host as mini (me@mini.example.com:22)") {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatal("probed a machine it was going to refuse:", out.String())
+	}
+	// The same host with a board home of its own is a second board.
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias", Home: "~/other-board"}, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A machine on the board with a home of its own is still the one meant
+// when an add for its host names no home.
+func TestAddWithNoHomeMeansTheBoardAlreadyThere(t *testing.T) {
+	far := healthyFar()
+	far.targets = map[string]string{
+		"mini.example.com": resolved("me", "mini.example.com", "22"),
+		"mini-alias":       resolved("me", "mini.example.com", "22"),
+	}
+	mini := host{Name: "mini", Destination: "mini.example.com", GateInbox: "gate-inbox", Tmux: "tmux", Home: "~/review/board"}
+	e := newManaged(t, far, mini)
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "mini-alias"}, &bytes.Buffer{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "with board home ~/review/board; for another board on that host, give its board home") {
+		t.Fatal(err)
+	}
+}
+
+// A LAN address resolves to another host, but the machine says who it is.
+func TestAddRefusesAMachineThatReportsAHostnameOnTheBoard(t *testing.T) {
+	far := healthyFar()
+	e := newManaged(t, far)
+	var out bytes.Buffer
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box.example.com"}, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "10.0.0.7"}, &out, nil)
+	if err == nil || !strings.Contains(err.Error(), "same machine as box-1: both report hostname Box-1.local") {
+		t.Fatal(err)
+	}
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "10.0.0.7", Force: true}, &out, nil); err != nil {
+		t.Fatal("--force did not add it:", err)
+	}
+}
+
+func TestAddTakesAGateInboxPath(t *testing.T) {
+	far := healthyFar()
+	far.hidden, far.loginPath = true, "/srv/review/bin/gate-inbox-machines"
+	// A machine reports the path of the binary that answered.
+	far.snap.About.GateInbox = far.loginPath
+	e := newManaged(t, far)
+	var out bytes.Buffer
+	_, err := e.addMachine(context.Background(), addOptions{Destination: "box", Name: "x"}, &out, nil)
+	if err != nil {
+		t.Fatal("the login shell should still find it:", err)
+	}
+	// Neither PATH nor the login shell knows a binary under another name.
+	far.loginPath = ""
+	out.Reset()
+	_, err = e.addMachine(context.Background(), addOptions{Destination: "box2"}, &out, nil)
+	if err == nil || !strings.Contains(out.String(), "give this build's full path there as the gate-inbox path (--gate-inbox)") {
+		t.Fatal(err, out.String())
+	}
+	far.loginPath = "/srv/review/bin/gate-inbox-machines"
+	far.snap.About.Hostname = "box2.local"
+	h, err := e.addMachine(context.Background(), addOptions{Destination: "box2", Name: "y", GateInbox: far.loginPath}, &out, nil)
+	if err != nil || h.Settings.GateInbox != far.loginPath {
+		t.Fatal(err, h)
+	}
+	if _, err := e.addMachine(context.Background(), addOptions{Destination: "box3", GateInbox: "bin/gate-inbox"}, &out, nil); err == nil {
+		t.Fatal("a relative path was taken")
+	}
+}
+
+func TestAddFormPassesPathAndHomeToItsSetupRow(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	far := healthyFar()
+	far.sshErr = errors.New("exit status 255: Permission denied (publickey).")
+	e := newManaged(t, far)
+	b := newFakeBoard()
+	e.board = b
+	u := &screenUI{}
+	e.ui = u
+	e.openAdd(context.Background(), "")
+	_, view := u.last()
+	f := view.(*addForm)
+	var ids []string
+	for _, field := range f.Fields() {
+		ids = append(ids, field.ID)
+	}
+	if strings.Join(ids, ",") != "destination,name,group,gate_inbox,home" {
+		t.Fatal(ids)
+	}
+	values := map[string]string{"destination": "box", "name": "", "group": "", "gate_inbox": "~/review/bin/gate-inbox-machines", "home": "~/review/board"}
+	f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: values})
+	waitFor(t, "the key problem", func() bool { return strings.Contains(text(f.Render(120, 40)), "ctrl+f") })
+	f.Key(extension.ViewKey{Action: actionFix, Key: "ctrl+f", Values: values})
+	if len(b.launches) != 1 || strings.Join(b.launches[0].Args, " ") != "--add --home ~/review/board --gate-inbox ~/review/bin/gate-inbox-machines -- box" {
+		t.Fatal(b.launches)
 	}
 }

@@ -457,6 +457,8 @@ func (f *addForm) Fields() []extension.Field {
 		{ID: "destination", Label: "Destination", Value: f.destination, Placeholder: "a host from ~/.ssh/config, a hostname, or user@host"},
 		{ID: "name", Label: "Name", Placeholder: "from its hostname"},
 		{ID: "group", Label: "Group", Placeholder: "top level; an existing group on this board"},
+		{ID: "gate_inbox", Label: "gate-inbox path", Placeholder: "found on its PATH or through its login shell"},
+		{ID: "home", Label: "Board home", Placeholder: "its default; GATE_INBOX_HOME if its board uses one"},
 	}
 }
 
@@ -472,7 +474,8 @@ func (f *addForm) Render(width, _ int) []extension.Line {
 func (f *addForm) Key(k extension.ViewKey) bool {
 	switch k.Action {
 	case extension.ActionSubmit:
-		opts := addOptions{Destination: k.Values["destination"], Name: k.Values["name"], Group: k.Values["group"]}
+		opts := addOptions{Destination: k.Values["destination"], Name: k.Values["name"], Group: k.Values["group"],
+			GateInbox: k.Values["gate_inbox"], Home: k.Values["home"]}
 		f.mu.Lock()
 		if f.busy {
 			f.mu.Unlock()
@@ -575,6 +578,9 @@ func (e *Extension) openSetupRow(ctx context.Context, opts addOptions) (string, 
 	}
 	if opts.Home != "" {
 		args = append(args, "--home", opts.Home)
+	}
+	if opts.GateInbox != "" {
+		args = append(args, "--gate-inbox", opts.GateInbox)
 	}
 	args = append(args, "--", strings.TrimSpace(opts.Destination))
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)

@@ -25,6 +25,8 @@ type suggestion struct {
 	// opens.
 	Status string
 	Ready  bool
+	// Hostname is what a probed machine reported about itself.
+	Hostname string
 }
 
 const (
@@ -175,10 +177,37 @@ func (e *discoverError) Error() string { return e.err.Error() + ": " + e.msg }
 // board already: the discover command's, probed, then ~/.ssh/config's.
 // It is slow, so the screen calls it off the board's loop.
 func (e *Extension) suggestions(ctx context.Context) ([]suggestion, string) {
+	machines := e.machines().all()
 	known := map[string]bool{}
-	for _, h := range e.machines().all() {
+	hostnames := map[string]bool{}
+	for _, h := range machines {
 		known[h.Destination] = true
 		known[h.Name] = true
+		// An alias in ~/.ssh/config often names a machine already on the
+		// board under another destination.
+		if target, ok := e.sshTarget(ctx, h.Destination); ok {
+			known[target] = true
+		}
+		if h.About != nil && h.About.Hostname != "" {
+			hostnames[strings.ToLower(h.About.Hostname)] = true
+		}
+	}
+	// fresh is whether d is not on the board, by its destination or by
+	// where ssh would take it, and remembers it so it is offered once.
+	fresh := func(d string) bool {
+		if known[d] {
+			return false
+		}
+		known[d] = true
+		target, ok := e.sshTarget(ctx, d)
+		if !ok {
+			return true
+		}
+		if known[target] {
+			return false
+		}
+		known[target] = true
+		return true
 	}
 	var out []suggestion
 	problem := ""
@@ -186,22 +215,60 @@ func (e *Extension) suggestions(ctx context.Context) ([]suggestion, string) {
 	if err != nil {
 		problem = "the discover command failed: " + err.Error()
 	}
+	var probed []suggestion
 	for _, d := range discovered {
-		if !known[d] {
-			known[d] = true
-			out = append(out, suggestion{Destination: d, From: fromDiscover})
+		if fresh(d) {
+			probed = append(probed, suggestion{Destination: d, From: fromDiscover})
 		}
 	}
-	e.probeSuggestions(ctx, out)
+	e.probeSuggestions(ctx, probed)
+	// A probed machine that reports the hostname of one on the board is
+	// that machine by another address, such as its LAN one.
+	for _, s := range probed {
+		if s.Hostname == "" || !hostnames[strings.ToLower(s.Hostname)] {
+			out = append(out, s)
+		}
+	}
 	if home, err := os.UserHomeDir(); err == nil {
 		for _, d := range sshConfigHosts(filepath.Join(home, ".ssh", "config")) {
-			if !known[d] {
-				known[d] = true
+			if fresh(d) {
 				out = append(out, suggestion{Destination: d, From: fromSSHConfig})
 			}
 		}
 	}
 	return out, problem
+}
+
+// sshTarget is where ssh would connect for destination: its user, host and
+// port as `ssh -G` resolves them from the operator's ssh config. It reads
+// the config only and connects nowhere, so two aliases for one machine
+// can be told apart from two machines.
+func (e *Extension) sshTarget(ctx context.Context, destination string) (string, bool) {
+	if validDestination(destination) != nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := e.run(ctx, append(append([]string{}, e.cfg.SSH...), "-G", "--", destination))
+	if err != nil {
+		return "", false
+	}
+	var user, hostname, port string
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, _ := strings.Cut(strings.TrimSpace(line), " ")
+		switch key {
+		case "user":
+			user = value
+		case "hostname":
+			hostname = strings.TrimSuffix(strings.ToLower(value), ".")
+		case "port":
+			port = value
+		}
+	}
+	if hostname == "" {
+		return "", false
+	}
+	return user + "@" + hostname + ":" + port, true
 }
 
 // probeSuggestions asks each machine for its sessions, a few at a time,
@@ -227,6 +294,9 @@ func (e *Extension) probeSuggestions(ctx context.Context, list []suggestion) {
 			}
 			snap, err := pollHost(ctx, e.run, cfg, h)
 			list[i].Status, list[i].Ready = probeSummary(snap, err)
+			if err == nil && snap.About != nil {
+				list[i].Hostname = snap.About.Hostname
+			}
 		}()
 	}
 	wg.Wait()

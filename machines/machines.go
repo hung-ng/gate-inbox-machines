@@ -176,7 +176,7 @@ const (
 	usageAttach     = "machines attach <machine> <session-id>"
 	usageCheck      = "machines check [<machine>...]"
 	usagePreview    = "machines preview <session-id>"
-	usageAdd        = "machines add [--name <name>] [--group <group>] [--home <dir>] [--force] <destination>"
+	usageAdd        = "machines add [--name <name>] [--group <group>] [--home <dir>] [--gate-inbox <path>] [--force] <destination>"
 	usageRemove     = "machines remove <machine>"
 	usageRename     = "machines rename <machine> <new-name>"
 	usagePause      = "machines pause <machine>"

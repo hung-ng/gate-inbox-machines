@@ -22,6 +22,9 @@ type addOptions struct {
 	Name        string
 	Group       string
 	Home        string
+	// GateInbox is this build's path on the machine, for one where neither
+	// its PATH nor its login shell finds it.
+	GateInbox string
 	// Force adds the machine even when a step that keeps it from working
 	// failed, for one that is set up later.
 	Force bool
@@ -98,7 +101,19 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 			return host{}, err
 		}
 	}
-	settings := hostSettings{Destination: opts.Destination, Group: opts.Group, Home: opts.Home}
+	opts.GateInbox = strings.TrimSpace(opts.GateInbox)
+	opts.Home = strings.TrimSpace(opts.Home)
+	if opts.GateInbox != "" && !strings.HasPrefix(opts.GateInbox, "/") && !strings.HasPrefix(opts.GateInbox, "~/") {
+		return host{}, fmt.Errorf("gate-inbox path %q must be a full path, or start with ~/", opts.GateInbox)
+	}
+	if target, ok := e.sshTarget(ctx, opts.Destination); ok && !opts.Force {
+		for _, h := range existing {
+			if other, ok := e.sshTarget(ctx, h.Destination); ok && other == target && sameBoard(h, opts.Home) {
+				return host{}, fmt.Errorf("%s reaches the same host as %s (%s), which is already on this board%s", opts.Destination, h.Name, target, otherBoardHint(h))
+			}
+		}
+	}
+	settings := hostSettings{Destination: opts.Destination, Group: opts.Group, Home: opts.Home, GateInbox: opts.GateInbox}
 	// The probe runs under a stand-in name; the real one may come from the
 	// hostname the machine reports.
 	probeHost, err := resolveHost("new", settings)
@@ -110,7 +125,7 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 	}
 	var result probeResult
 	for tries := 0; ; tries++ {
-		result = e.probe(ctx, probeHost)
+		result = forAdding(e.probe(ctx, probeHost))
 		result.print(out, opts.Destination)
 		blocked := result.blocking()
 		// A host key is checked before the login, so a machine can need
@@ -130,6 +145,15 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 	}
 	if blocked := result.blocking(); blocked != nil && !opts.Force {
 		return host{}, fmt.Errorf("%s was not added: %s failed; fix that and add it again, or pass --force to add it anyway", opts.Destination, blocked.Name)
+	}
+	// The LAN address of a machine already on the board passes every
+	// check: what it reports about itself is what tells them apart.
+	if result.Snapshot != nil && result.Snapshot.About != nil && result.Snapshot.About.Hostname != "" && !opts.Force {
+		for _, h := range existing {
+			if h.About != nil && strings.EqualFold(h.About.Hostname, result.Snapshot.About.Hostname) && sameBoard(h, opts.Home) {
+				return host{}, fmt.Errorf("%s is the same machine as %s: both report hostname %s%s; pass --force to add it anyway", opts.Destination, h.Name, h.About.Hostname, otherBoardHint(h))
+			}
+		}
 	}
 	name := opts.Name
 	if name == "" {
@@ -171,6 +195,41 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 	return h, nil
 }
 
+// sameBoard is whether adding a machine with board home home, on the host
+// h is on, would show h's board a second time. One host can run two
+// boards, each on a home of its own, so naming another home is a second
+// machine here. Naming none is taken as h's board, since a home is easy to
+// leave out and a second board on one host is rare.
+func sameBoard(h host, home string) bool {
+	return home == "" || home == h.Home
+}
+
+func otherBoardHint(h host) string {
+	if h.Home != "" {
+		return fmt.Sprintf(" with board home %s; for another board on that host, give its board home", h.Home)
+	}
+	return ""
+}
+
+// forAdding rewords the fixes that name a config key in terms of what an
+// add takes: the add form's fields, or the add command's flags.
+func forAdding(result probeResult) probeResult {
+	for i, step := range result.Steps {
+		if step.Err == nil {
+			continue
+		}
+		switch {
+		case step.Name == "gate-inbox" && notFound(step.Err):
+			result.Steps[i].Fix = "no gate-inbox there, even through your login shell; give this build's full path there as the gate-inbox path (--gate-inbox)"
+		case step.Name == "board running":
+			result.Steps[i].Fix = "start that machine's board; if it runs with GATE_INBOX_HOME, give that as the board home (--home)"
+		case step.Name == "attachable session":
+			result.Steps[i].Fix = "if that board sets tmux_socket, set it for this machine once it is added"
+		}
+	}
+	return result
+}
+
 // fixAtTerminal runs the fix a failed ssh step needs, on the operator's
 // terminal, once they agree to it. It says whether it ran.
 func (e *Extension) fixAtTerminal(ctx context.Context, term *terminal, destination, fix string) bool {
@@ -208,7 +267,8 @@ func (e *Extension) runAdd(ctx context.Context, args []string) error {
 	name := set.String("name", "", "the machine's name on this board; defaults to its hostname")
 	group := set.String("group", "", "an existing group to file its rows under")
 	home := set.String("home", "", "GATE_INBOX_HOME of the board on that machine, if it uses one")
-	force := set.Bool("force", false, "add it even if a check that keeps it from working fails")
+	gateInbox := set.String("gate-inbox", "", "this build's full path on that machine, if neither its PATH nor its login shell finds it")
+	force := set.Bool("force", false, "add it even if a check that keeps it from working fails, or it looks like a machine already added")
 	operands, err := cmdline.Parse(os.Stdout, program, set, args, 1, 1)
 	if err != nil {
 		return err
@@ -217,7 +277,7 @@ func (e *Extension) runAdd(ctx context.Context, args []string) error {
 	if isTerminal(os.Stdin) {
 		term = &terminal{in: bufio.NewReader(os.Stdin), out: os.Stdout, run: e.attach}
 	}
-	h, err := e.addMachine(ctx, addOptions{Destination: operands[0], Name: *name, Group: *group, Home: *home, Force: *force}, os.Stdout, term)
+	h, err := e.addMachine(ctx, addOptions{Destination: operands[0], Name: *name, Group: *group, Home: *home, GateInbox: *gateInbox, Force: *force}, os.Stdout, term)
 	if err != nil {
 		var needs errNeedsTerminal
 		if errors.As(err, &needs) {
@@ -246,6 +306,7 @@ func (e *Extension) runSetupPane(ctx context.Context, args []string, caller stri
 	name := set.String("name", "", "")
 	group := set.String("group", "", "")
 	home := set.String("home", "", "")
+	gateInbox := set.String("gate-inbox", "", "")
 	operands, err := cmdline.Parse(os.Stdout, program, set, args, 1, 1)
 	if err != nil {
 		return err
@@ -253,7 +314,7 @@ func (e *Extension) runSetupPane(ctx context.Context, args []string, caller stri
 	in := bufio.NewReader(os.Stdin)
 	term := &terminal{in: in, out: os.Stdout, run: e.attach}
 	fmt.Printf("Adding %s to this board.\n\n", operands[0])
-	h, err := e.addMachine(ctx, addOptions{Destination: operands[0], Name: *name, Group: *group, Home: *home}, os.Stdout, term)
+	h, err := e.addMachine(ctx, addOptions{Destination: operands[0], Name: *name, Group: *group, Home: *home, GateInbox: *gateInbox}, os.Stdout, term)
 	if err != nil {
 		fmt.Printf("\n%v\n", err)
 	} else {

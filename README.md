@@ -84,6 +84,24 @@ The name defaults to the first part of the hostname the machine reports, such as
 with a letter. Each row's name starts with it, such as `box-1-upgrade-http-client`, so a short one
 reads better.
 
+Two optional settings cover a machine set up some other way:
+
+- **gate-inbox path** (`--gate-inbox`): this build's full path there, when its PATH and login shell
+  don't find it, such as a build kept under another name in a folder of its own
+- **board home** (`--home`): `GATE_INBOX_HOME` of that machine's board, when it uses one. Without
+  it, the check reads the machine's default home, and reports its board as stopped.
+
+Adding refuses a machine that's already on the board under another name:
+
+- an alias that `ssh -G` resolves to the same user, host and port as a machine there, such as a
+  `~/.ssh/config` name for it. This is read from your ssh config and connects nowhere.
+- an address that reaches the same machine some other way, such as its LAN address. The checks
+  pass, and then the machine reports the same hostname as one already on the board.
+
+One host can run two boards, each on its own home. Giving a different board home adds the second
+one. With no board home given, adding takes it to mean the board already there. `--force` adds it
+anyway.
+
 Adding a machine changes nothing on that machine. SSH must already be on there: on a Mac, Remote
 Login under System Settings → General → Sharing, and on Linux, the `sshd` service.
 
@@ -158,8 +176,9 @@ Starting the board from that Mac's own desktop session avoids it.
 
 ### Suggestions
 
-The machines screen suggests machines to add from two places, and leaves out any already on the
-board:
+The machines screen suggests machines to add from two places. It leaves out any already on the
+board, by destination or by where `ssh -G` says it leads, and any discovered machine that reports
+the hostname of one already there:
 
 - **Hosts in `~/.ssh/config`**, and the files it includes. Patterns such as `*.example.com` are
   left out. The board doesn't connect to these until you pick one, since that file often names
@@ -209,7 +228,7 @@ out Homebrew. So until a machine has reported its own paths, commands sent to it
 
 The first four keys go directly under `[extensions.machines]`, so no machine can be named `poll`,
 `ssh`, `control_path` or `discover`. The per-machine keys go in a `config.toml` table, or with
-`machines add` for `group` and `home`. A key you set wins over what the machine reports.
+`machines add` for `group`, `home` and `gate_inbox` (`--gate-inbox`). A key you set wins over what the machine reports.
 
 | Key | Default | What it does |
 |---|---|---|
@@ -395,7 +414,8 @@ The tests cover config, quoting (each quoted word is checked against real `sh`, 
 `zsh`, including `start-board`'s command), the PATH a command gets on the other machine,
 `machines check`, the wire format and what a machine reports about itself, adding, pausing,
 renaming and removing machines, two processes sharing the machine files, suggestions from
-`~/.ssh/config` and a `discover` command, the machines screen and its add form, setup rows, the
+`~/.ssh/config` and a `discover` command, telling a machine already on the board from a new one,
+the machines screen and its add form, setup rows, the
 reconcile plan (a stopped board included), the reconnect loop, the launch guard, and full passes
 against a fake board.
 
