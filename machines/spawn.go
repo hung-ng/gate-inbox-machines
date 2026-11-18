@@ -1,7 +1,9 @@
 package machines
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,7 +23,7 @@ func spawnArgv(cfg config, h host, cli, task, directory string) []string {
 		args = append(args, "--directory", directory)
 	}
 	args = append(args, "--json")
-	return sshArgv(cfg, false, h.Destination, machineCommand(h, h.GateInbox, args...))
+	return sshArgv(cfg, false, h.Destination, `exec "$SHELL" -l -c `+shellWord(machineCommand(h, h.GateInbox, args...)))
 }
 
 func availableTools(ctx context.Context, h extension.Host) ([]string, error) {
@@ -113,7 +115,10 @@ func (f *spawnForm) Key(k extension.ViewKey) bool {
 	go func() {
 		ctx, cancel := context.WithTimeout(f.ctx, 30*time.Second)
 		defer cancel()
-		_, err := f.e.run(ctx, spawnArgv(f.e.cfg, h, cli, task, directory))
+		out, err := f.e.run(ctx, spawnArgv(f.e.cfg, h, cli, task, directory))
+		if err == nil {
+			err = parseSpawnReply(out)
+		}
 		if err != nil {
 			f.e.ui.Notify("Could not start session on " + name + ": " + err.Error())
 		} else {
@@ -150,4 +155,23 @@ func (c *toolCache) copy() map[string][]string {
 		result[name] = append([]string(nil), tools...)
 	}
 	return result
+}
+
+// Login files sometimes print a greeting. Accept a JSON reply after it,
+// but require a session id so a successful shell alone is not a spawn.
+func parseSpawnReply(out []byte) error {
+	for offset := 0; offset < len(out); {
+		var reply struct {
+			ID string `json:"id"`
+		}
+		if json.NewDecoder(bytes.NewReader(out[offset:])).Decode(&reply) == nil && sessionIDPattern.MatchString(reply.ID) {
+			return nil
+		}
+		i := bytes.IndexByte(out[offset:], '\n')
+		if i < 0 {
+			break
+		}
+		offset += i + 1
+	}
+	return fmt.Errorf("the machine's spawn reply contains no session id")
 }

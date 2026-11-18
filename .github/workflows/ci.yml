@@ -1,0 +1,31 @@
+name: Go
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '23 8 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux zsh
+      - if: runner.os == 'macOS'
+        run: brew list tmux >/dev/null 2>&1 || brew install tmux
+      - if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: go get github.com/usestring/gate-inbox@main
+      - run: test -z "$(gofmt -l .)"
+      - run: go build ./cmd/gate-inbox
+      - run: go vet ./...
+      - run: go test -race ./...

@@ -92,14 +92,19 @@ func sshArgv(cfg config, tty bool, destination, command string) []string {
 //
 // gate-inbox looks tmux up on PATH even to list sessions, and the PATH a
 // non-interactive ssh command gets is the system's alone: on a Mac,
-// Homebrew's tmux is not on it. A host whose tmux is named by its full path
-// has that directory put ahead of PATH for the command.
+// Homebrew's tmux is not on it. Configured executable directories go
+// first; fallbacks go after PATH so the user's choices win.
 func machineCommand(h host, program string, args ...string) string {
 	words := append([]string{program}, args...)
-	var env []string
-	if dir, _, ok := cutLastSlash(h.Tmux); ok && dir != "" {
-		env = append(env, "PATH="+shellWord(dir)+`:"$PATH"`)
+	var dirs []string
+	for _, path := range []string{h.Tmux, h.GateInbox} {
+		if dir, _, ok := cutLastSlash(path); ok && dir != "" {
+			dirs = append(dirs, shellWord(dir))
+		}
 	}
+	dirs = append(dirs, `"$PATH"`, `"$HOME"/go/bin`, `"$HOME"/.local/bin`, "/opt/homebrew/bin", "/usr/local/bin")
+	env := []string{"PATH=" + strings.Join(dirs, ":")}
+
 	if h.Home != "" {
 		env = append(env, "GATE_INBOX_HOME="+shellWord(h.Home))
 	}

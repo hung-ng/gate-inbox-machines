@@ -81,10 +81,13 @@ type mirrors struct {
 	tools   *toolCache
 }
 
+// stateFile is the mirrors' saved state, in the extension's data dir.
+const stateFile = "mirrors.json"
+
 func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logger, run runner, dataDir string) *mirrors {
 	m := &mirrors{
 		cfg: cfg, board: board, ui: ui, log: log, run: run,
-		path:    filepath.Join(dataDir, "mirrors.json"),
+		path:    filepath.Join(dataDir, stateFile),
 		now:     time.Now,
 		pinned:  map[string]string{},
 		failed:  map[string]time.Time{},

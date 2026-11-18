@@ -72,7 +72,7 @@ func TestListArgv(t *testing.T) {
 		"ssh",
 		"-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
 		"-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/gir-test/%C", "-o", "ControlPersist=10m",
-		"--", "me@mini", `exec "$HOME"/go/bin/gate-inbox machines sessions --json --tmux tmux`,
+		"--", "me@mini", `exec env PATH="$HOME"/go/bin:"$PATH":"$HOME"/go/bin:"$HOME"/.local/bin:/opt/homebrew/bin:/usr/local/bin "$HOME"/go/bin/gate-inbox machines sessions --json --tmux tmux`,
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("listArgv =\n%q\nwant\n%q", got, want)
@@ -82,7 +82,7 @@ func TestListArgv(t *testing.T) {
 func TestListArgvWithHome(t *testing.T) {
 	h := host{Name: "mini", Destination: "mini", GateInbox: "gate-inbox", Tmux: "tmux", Home: "/srv/gate inbox"}
 	got := listArgv(testConfig(), h)
-	if last := got[len(got)-1]; last != `exec env GATE_INBOX_HOME='/srv/gate inbox' gate-inbox machines sessions --json --tmux tmux` {
+	if last := got[len(got)-1]; last != `exec env PATH="$PATH":"$HOME"/go/bin:"$HOME"/.local/bin:/opt/homebrew/bin:/usr/local/bin GATE_INBOX_HOME='/srv/gate inbox' gate-inbox machines sessions --json --tmux tmux` {
 		t.Errorf("command on the machine = %s", last)
 	}
 }
@@ -93,7 +93,7 @@ func TestListArgvWithHome(t *testing.T) {
 func TestListArgvPutsTmuxOnPath(t *testing.T) {
 	h := host{Name: "mini", Destination: "mini", GateInbox: "/Users/me/go/bin/gate-inbox", Tmux: "/opt/homebrew/bin/tmux", TmuxSocket: "agents"}
 	got := listArgv(testConfig(), h)
-	want := `exec env PATH=/opt/homebrew/bin:"$PATH" /Users/me/go/bin/gate-inbox machines sessions --json --tmux /opt/homebrew/bin/tmux --tmux-socket agents`
+	want := `exec env PATH=/opt/homebrew/bin:/Users/me/go/bin:"$PATH":"$HOME"/go/bin:"$HOME"/.local/bin:/opt/homebrew/bin:/usr/local/bin /Users/me/go/bin/gate-inbox machines sessions --json --tmux /opt/homebrew/bin/tmux --tmux-socket agents`
 	if last := got[len(got)-1]; last != want {
 		t.Errorf("command on the machine = %s\nwant                    %s", last, want)
 	}

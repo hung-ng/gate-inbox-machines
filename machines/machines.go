@@ -138,13 +138,14 @@ func (e *Extension) StartBoard(ctx context.Context, board extension.BoardHost) (
 const (
 	usageSessions = "machines sessions [--tmux <path>] [--tmux-socket <name>] [--json]"
 	usageAttach   = "machines attach <machine> <session-id>"
+	usageCheck    = "machines check [<machine>...]"
 )
 
 func (e *Extension) Commands() []extension.Command {
 	return []extension.Command{{
 		Name:  "machines",
-		Usage: "machines <sessions|attach>",
-		About: "show this board's sessions to your other machines' boards, and attach to one of theirs",
+		Usage: "machines <sessions|attach|check>",
+		About: "show this board's sessions to your other machines' boards, attach to one of theirs, and check the setup",
 		Run:   e.runMachines,
 	}}
 }
@@ -160,6 +161,11 @@ func (e *Extension) runMachines(ctx context.Context, args []string, host extensi
 			Name: "attach", Usage: usageAttach,
 			About: "attach this terminal to an agent session on a configured machine, reconnecting until the session ends; mirrors run it",
 			Run:   func(args []string) error { return e.runAttach(ctx, args, host) },
+		},
+		{
+			Name: "check", Usage: usageCheck,
+			About: "check that each configured machine can be polled and attached to, and say what to fix",
+			Run:   func(args []string) error { return e.runCheck(ctx, args, os.Stdout) },
 		},
 	}, args)
 }

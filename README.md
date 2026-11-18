@@ -29,16 +29,18 @@ changed.
 
 ## Install
 
-Build this on every machine, the one you sit at and each one it shows:
+On the machine you sit at, build this in place of the `gate-inbox` you run now:
 
 ```bash
 go install github.com/hung-ng/gate-inbox-machines/cmd/gate-inbox@latest
 ```
 
-It is Gate Inbox plus this extension, so it replaces the `gate-inbox` binary you run now. Your
-config, state and sessions carry over. It is pinned to Gate Inbox v1.1.0, the release a plain
+Your config, state and sessions carry over. It is pinned to Gate Inbox v1.1.0, the release a plain
 `go install github.com/usestring/gate-inbox@latest` installs; `go get
 github.com/usestring/gate-inbox@<version>` and a rebuild moves it to another.
+
+Each other machine needs this build only to answer `machines sessions`. Its board can keep
+running stock Gate Inbox, as long as `gate_inbox` names a copy of this build on that machine.
 
 Each machine needs an SSH key login from the one you sit at that works without a prompt, because
 the extension runs SSH with `BatchMode=yes`. Check it with `ssh <machine> true`.
@@ -51,17 +53,32 @@ rows' badges say:
 ```toml
 [extensions.machines.mini]
 destination = "hung-mini"                      # an ssh destination; defaults to the table's name
-gate_inbox  = "~/go/bin/gate-inbox"            # this build on that machine
-tmux        = "/opt/homebrew/bin/tmux"         # tmux on that machine
 
 [extensions.machines.box]
 destination = "me@box.example.ts.net"
-gate_inbox  = "/usr/local/bin/gate-inbox"
 ```
 
-A non-interactive SSH command gets the system PATH only. On a Mac that leaves out Homebrew, so give
-`gate_inbox` and `tmux` as full paths. When `tmux` is a full path, its directory is put on PATH for
-the command on that machine too, because `gate-inbox` looks tmux up even to list sessions.
+Most setups need only `destination`. The PATH a non-interactive SSH command gets usually leaves
+out Homebrew, so commands sent to a machine look for `gate-inbox` and tmux on its PATH and then in
+`~/go/bin`, `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`. Those come after the
+machine's own PATH, so they never override it. Set `gate_inbox` or `tmux` to a full path when
+they live somewhere else.
+
+Then check the setup from a plain shell:
+
+```bash
+gate-inbox machines check        # every configured machine
+gate-inbox machines check mini   # just one
+```
+
+It tries each step the board needs, in order: SSH without a prompt, `gate-inbox` and this build's
+`machines` command there, tmux, the sessions reply, that machine's board running, and a session a
+mirror can attach to. A failed step ends with what to change, and the command exits non-zero:
+
+```text
+mini: ssh OK
+mini: gate-inbox FAIL (exit status 127: env: gate-inbox: No such file or directory); set gate_inbox to its full path
+```
 
 Other keys. The first three go directly under `[extensions.machines]`, so a machine can't be
 named `poll`, `ssh` or `control_path`:
@@ -71,6 +88,9 @@ named `poll`, `ssh` or `control_path`:
 | `poll` | `"3s"` | How often each machine is asked for its sessions |
 | `ssh` | `["ssh"]` | The ssh command and any options of your own, such as `["ssh", "-F", "/Users/me/.ssh/agents"]` |
 | `control_path` | `/tmp/gate-inbox-machines-<uid>/%C` | Where ssh keeps the connection it shares between a machine's polls and its mirrors. `"none"` turns sharing off |
+| `<name>.destination` | the table's name | The ssh destination: a name from `~/.ssh/config`, or `user@host` |
+| `<name>.gate_inbox` | `gate-inbox` | This build on that machine |
+| `<name>.tmux` | `tmux` | tmux on that machine |
 | `<name>.home` | none | `GATE_INBOX_HOME` of the board on that machine, if it uses one |
 | `<name>.tmux_socket` | none | That board's `tmux_socket`, if it sets one |
 | `<name>.group` | top level | An existing group to file the machine's rows under. An extension cannot create a group, so make it first with `ctrl+alt+g` |
@@ -78,6 +98,9 @@ named `poll`, `ssh` or `control_path`:
 The build also supplies a `[tools.mirror]` block, which is the tool mirrors launch with. It shows
 in the new-session picker. Starting it from there only prints a note saying to pick an agent CLI,
 and `machines sessions` never reports such a session. Uncheck it under Settings → CLIs to hide it.
+
+A machine's polls and mirrors share one SSH connection. It closes 10 minutes after the last of
+them stops.
 
 ## What you see
 
@@ -92,14 +115,17 @@ and `machines sessions` never reports such a session. Uncheck it under Settings 
   filter and Tab jumps. Nothing is archived or relaunched until the machine answers again.
 - A reachable machine whose board stopped gets the same treatment, with
   `✕ mini board stopped` and a detail line asking you to start its board. Agent processes can
-  keep running after their board quits, but their saved statuses cannot be trusted. The PID in the config
-  directory's `manager.lock` indicates whether the board process is alive. Recovery restores the real status
-  and releases ownership.
+  keep running after their board quits, but their saved statuses cannot be trusted. That
+  machine's `machines sessions` tells by checking that the process whose PID is in its board's
+  `manager.lock` is alive. It never takes that lock, which could make a board starting at the same
+  moment take over from a live one. A reply from an older build without this check reads as
+  running. When the board is back, the rows get their real status again.
 - If a mirror can't attach, its pane says why (the connection dropped, no tmux on the PATH, tmux
   refused the target) and tries again with backoff (1s, 2s, 4s, up to 30s). The row stays, and the
   board's log names the reason once. A mirror's pane never exits on its own: a pane whose command
   exits is left on a local shell, which triage would hand you as if it were the agent on the other
-  machine.
+  machine. If the tmux client on that machine is detached, the mirror attaches again half a second
+  later.
 - Restarting the board reconnects every mirror in its own row, keeping its name and priority, so
   the panes pick up any setting you changed.
 - Archiving a mirror puts it away until its session stops running on its machine. On Gate Inbox
@@ -107,6 +133,19 @@ and `machines sessions` never reports such a session. Uncheck it under Settings 
   mirror from the archive brings it back.
 - The board's log records each mirror the extension starts, reconnects, archives or sees put away,
   with the reason.
+
+## Using it
+
+- Enter on a mirror focuses it. Every key then goes to the agent on the other machine, except
+  your board's own chords: `ctrl+q` goes back to your list (in triage, on to the next session),
+  and `ctrl+\` always goes back to the list. The status line at the bottom of the pane is drawn
+  by the other machine's board, so its key hints are for that board.
+- `N` on the list starts an agent on another machine. See the next section.
+- If scrolling leaves a mirror in tmux scroll mode, press `q` inside it to type again. On the
+  list, `q` quits your board.
+- `x` on the list, or `ctrl+x` inside a mirror once you confirm, closes the mirror and files its
+  row in the archive. The agent on the other machine keeps running. To get the mirror back, open
+  the archived view from the `:` menu, press `u` on its row, then confirm with `y` or Enter.
 
 ## Start a session on another machine
 
@@ -121,11 +160,12 @@ CLI field accepts a typed name. Discovery lists configured tools except shells, 
 both mirror names, regardless of the non-interactive SSH PATH. If a CLI is not installed,
 spawn's error appears in the status bar.
 
-Submission runs `spawn --nest=false` over non-interactive SSH and wakes the poll immediately.
-Both machines should run this build to report board liveness. An older reply without
-`board_running` is treated as running. Detection only reads the singleton PID and checks
-process existence. It never locks `manager.lock`, since a lock probe could trigger takeover
-in a board starting concurrently.
+Submitting runs `spawn --nest=false` on that machine through your login shell there, then polls
+the machine at once so the mirror shows up. The login shell matters because Gate Inbox copies the
+environment of the process that starts a session into the session. A spawn run straight from SSH
+would hand the agent SSH's bare PATH, and a CLI installed by Homebrew or in `~/.local/bin` would
+not be found. Polls skip the login shell, which keeps them fast. A greeting a login file prints
+before the reply is skipped.
 
 ## Scroll mode limitation
 
@@ -145,13 +185,18 @@ sequences, which is left as future work.
 
 - **Nothing listens on a port.** Everything goes over SSH with your key, so the extension can
   reach on a machine exactly what you could by SSH-ing in.
-- **Only focused mirror input reaches an existing agent on another machine.**
-  Starting a new agent through the machine form is an explicit operator action.
-  The `mirror` tool block declares no `activity_cutoff`, so the board refuses to queue messages,
-  snippets or naming requests into a mirror. Anything queued there would skip the checks that
-  machine's board makes on when an agent can safely read input. `skip_rename_directive` and
-  `mcp = "none"` keep the board's naming request and its MCP server out of the pane. Don't add an
+- **What reaches an agent on another machine:** keys you type into a focused mirror, and an agent
+  you start with `N`. The board refuses to queue messages into a mirror, because the `mirror` tool
+  block declares no `activity_cutoff`: a queued message would skip the checks that machine's
+  board makes on when an agent can safely read input. `skip_rename_directive` and `mcp = "none"`
+  keep the board's naming request and its MCP server out of a new mirror's pane. Don't add an
   `activity_cutoff` to that block.
+- **Two list keys still type into a mirror straight away.** On v1.1.0, a snippet key and `r`
+  (which asks the agent to name itself) type into a row's pane at once. On a local row the board
+  holds a snippet back while the agent shows a dialog. It can't for a mirror: the board spots a
+  dialog by matching the pane against the tool's patterns, and giving the `mirror` tool the agent
+  CLIs' patterns also overrides the status pinned from the other machine. So a snippet or `r` on a
+  mirror could answer a question on the other machine. Don't use either on a mirror.
 - **Boards that mirror each other don't loop.** `machines sessions` leaves out mirror rows, so two
   machines can each list the other.
 - **Commands sent to a machine are quoted for any login shell.** The command ssh hands the far
@@ -163,6 +208,13 @@ sequences, which is left as future work.
 
 ## Limits
 
+- A mirror can't move to another tool or migrate to a local agent. The board refuses the launch,
+  since it would start an agent here in place of the one on the other machine. Forking is refused
+  too, as a mirror has no conversation here. Use `N` to start an agent on that machine.
+- A session started by another session on its machine shows here as its own top-level row, not
+  under its parent. The extension API can file a new row under a parent but can't move a row later,
+  and a parent reconnected on restart would leave its children under the old row. Keeping the
+  layout needs a way to move a row.
 - Only sessions the machine's board launched are mirrored: each has a `gi_<id>` tmux session to
   attach to. A pane the board adopted as it was, started by hand inside some other tmux session,
   is left out, because attaching would bring that whole tmux session, other windows and all, into
@@ -174,9 +226,6 @@ sequences, which is left as future work.
 - Priority tiers set on the other machine are not carried over. Set a mirror's priority on your
   own board.
 - On a narrow list the badge can be cut off. The detail line always shows the machine.
-- Inside a focused mirror, `ctrl+q` is your board's own key and returns to your list. The status
-  line drawn inside the pane belongs to the other machine's board, so ignore the keys it lists. If
-  the tmux client on that machine is detached, the mirror attaches again half a second later.
 
 ## Develop
 
@@ -185,8 +234,9 @@ go vet ./...
 go test -race ./...
 ```
 
-The tests cover config, quoting (each quoted word is checked against a real `sh`), the wire
-format, the reconcile plan, the reconnect loop, and full passes against a fake board.
+The tests cover config, quoting (each quoted word is checked against real `sh`, `bash` and
+`zsh`), the PATH a command gets on the other machine, `machines check`, the wire format, the
+reconcile plan, the reconnect loop, the launch guard, and full passes against a fake board.
 
 It was also checked end to end with two boards on one machine. Board A ran the scripted agent from
 Gate Inbox's `tools/demo/fake-agent.sh`, and board B mirrored A through a stand-in `ssh` that runs
@@ -199,7 +249,17 @@ covered:
 - the machine dropping off and coming back
 - the session ending on its machine and its mirror being archived
 
-That run was done on Gate Inbox `main` (d3eb72d) and again on v1.1.0. The same flow then ran
+That run was done on Gate Inbox `main` (d3eb72d) and again on v1.1.0. Later runs on v1.1.0 added a
+second far board and covered:
+
+- `N` starting an agent on the second machine, and that agent finding a CLI that only the
+  machine's `.zprofile` puts on PATH
+- one machine offline while the other stays healthy, and `machines check` on both
+- a stopped and restarted far board
+- kill and revive, archive and restore, and a lost state file
+- two boards mirroring each other
+
+ The same flow then ran
 between two Macs over real SSH, with the board on a MacBook mirroring a Mac mini whose login shell
 is zsh. The question showed on the MacBook, an answer typed there reached the agent on the mini,
 and the row went to finished. Restarting the board, reconnecting and archiving were checked on

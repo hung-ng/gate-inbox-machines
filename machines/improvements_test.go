@@ -113,7 +113,7 @@ func TestSpawnArgvAndForm(t *testing.T) {
 	h.Tmux = "/opt/bin/tmux"
 	argv := spawnArgv(cfg, h, "agent", "it's $(id)", "/a path")
 	command := argv[len(argv)-1]
-	want := "exec env PATH=/opt/bin:\"$PATH\" GATE_INBOX_HOME='/some board' gate-inbox spawn '--nest=false' --tool agent --prompt 'it'\\''s $(id)' --directory '/a path' --json"
+	want := `exec "$SHELL" -l -c ` + shellWord(machineCommand(h, h.GateInbox, "spawn", "--nest=false", "--tool", "agent", "--prompt", "it's $(id)", "--directory", "/a path", "--json"))
 	if command != want {
 		t.Fatalf("%s\nwant %s", command, want)
 	}
@@ -196,7 +196,7 @@ func TestFormOpensSpawnsNotifiesAndWakesPoll(t *testing.T) {
 		}
 		select {
 		case a := <-calls:
-			if !strings.Contains(a[len(a)-1], "spawn '--nest=false' --tool agent --prompt hello --directory /work --json") {
+			if !strings.Contains(a[len(a)-1], "--tool agent --prompt hello --directory /work --json") {
 				t.Fatal(a)
 			}
 		case <-time.After(time.Second):
