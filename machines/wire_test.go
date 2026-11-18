@@ -157,7 +157,7 @@ func TestBoardSingletonPID(t *testing.T) {
 
 func TestListSessionsRejectsIncompletePages(t *testing.T) {
 	failed := errors.New("list failed")
-	for _, outcome := range []string{"missing cursor", "repeated cursor", "later error"} {
+	for _, outcome := range []string{"missing cursor", "repeated cursor", "later error", "skipped row"} {
 		t.Run(outcome, func(t *testing.T) {
 			calls := 0
 			list := func(_ context.Context, filter extension.SessionFilter) (extension.SessionList, error) {
@@ -172,6 +172,12 @@ func TestListSessionsRejectsIncompletePages(t *testing.T) {
 				}
 				if outcome == "missing cursor" {
 					page.Cursor = ""
+				}
+				if outcome == "skipped row" {
+					page.Matched = 3
+					if filter.After != "" {
+						page.Truncated, page.Cursor = false, ""
+					}
 				}
 				if outcome == "later error" && filter.After != "" {
 					return extension.SessionList{}, failed

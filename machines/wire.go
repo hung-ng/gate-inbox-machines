@@ -94,6 +94,7 @@ func listSessions(ctx context.Context, sessions extension.SessionService, attach
 
 func allSessions(ctx context.Context, list func(context.Context, extension.SessionFilter) (extension.SessionList, error)) ([]extension.SessionInfo, error) {
 	var rows []extension.SessionInfo
+	matched := 0
 	seen := map[string]bool{}
 	cursors := map[string]bool{}
 	filter := extension.SessionFilter{Limit: 500}
@@ -109,7 +110,13 @@ func allSessions(ctx context.Context, list func(context.Context, extension.Sessi
 			seen[row.ID] = true
 		}
 		rows = append(rows, page.Sessions...)
+		matched = max(matched, page.Matched)
 		if !page.Truncated {
+			// A row can move behind the cursor between pages. Retry the
+			// scan rather than treating a missed row as gone.
+			if len(rows) < matched {
+				return nil, fmt.Errorf("board matched %d sessions but returned %d across all pages", matched, len(rows))
+			}
 			return rows, nil
 		}
 		if page.Cursor == "" || cursors[page.Cursor] {
