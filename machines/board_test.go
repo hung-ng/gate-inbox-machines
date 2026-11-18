@@ -24,7 +24,6 @@ type fakeBoard struct {
 	launches  []extension.LaunchRequest
 	pins      []string
 	archives  []string
-	replaces  []string
 	next      int
 	launchErr error
 }
@@ -50,7 +49,7 @@ func (b *fakeBoard) Launch(_ context.Context, req extension.LaunchRequest) (exte
 	b.next++
 	info := extension.SessionInfo{
 		ID: fmt.Sprintf("l%d", b.next), Name: req.Name, Tool: req.Tool, Group: req.Group,
-		Role: extensionID + "/" + req.Role, Running: true,
+		Role: extensionID + "/" + req.Role, Running: true, Status: "idle",
 	}
 	b.sessions[info.ID] = info
 	b.launches = append(b.launches, req)
@@ -60,28 +59,11 @@ func (b *fakeBoard) Launch(_ context.Context, req extension.LaunchRequest) (exte
 func (b *fakeBoard) PinStatus(_ context.Context, id, status string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	row := b.sessions[id]
+	row.Status = status
+	b.sessions[id] = row
 	b.pins = append(b.pins, id+"="+status)
 	return nil
-}
-
-// Replace starts a new row in the old one's place, as the board does: the
-// new row keeps the old one's name and group, and the old one is left dead
-// on the list until something archives it.
-func (b *fakeBoard) Replace(_ context.Context, id string, req extension.LaunchRequest, _ ...extension.ReplaceOptions) (extension.SessionInfo, extension.ReplaceHandle, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	old := b.sessions[id]
-	dead := old
-	dead.Running = false
-	b.sessions[id] = dead
-	b.next++
-	info := extension.SessionInfo{
-		ID: fmt.Sprintf("l%d", b.next), Name: old.Name, Tool: req.Tool, Group: old.Group,
-		Role: extensionID + "/" + req.Role, Running: true,
-	}
-	b.sessions[info.ID] = info
-	b.replaces = append(b.replaces, id+" "+strings.Join(req.Args, " ")+" group="+req.Group+" name="+req.Name)
-	return info, nil, nil
 }
 
 func (b *fakeBoard) Archive(_ context.Context, id string) error {
@@ -167,9 +149,7 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 		t.Errorf("badge %q fact %q", ui.badges["l1"], ui.facts["l1"])
 	}
 
-	// The state survives the board: a new loop on the same directory keeps
-	// the row it launched rather than launching another, and reconnects it
-	// once in its place, so the pane runs with the settings this run read.
+	// A fresh reconcile loop follows the existing row and pane.
 	var saved state
 	data, err := os.ReadFile(filepath.Join(dir, "mirrors.json"))
 	if err != nil {
@@ -184,12 +164,12 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	if len(board.launches) != 1 {
 		t.Errorf("a restarted loop launched again: %+v", board.launches)
 	}
-	if strings.Join(board.replaces, ";") != "l1 mini a1 group= name=" || board.pins[len(board.pins)-1] != "l2=working" {
-		t.Errorf("replaces = %v, pins = %v; want l1 reconnected as l2 and pinned working", board.replaces, board.pins)
+	if got := board.sessions["l1"]; got.Status != "working" || !got.Running || len(board.archives) != 0 || m.state.Mirrors["mini/a1"] != "l1" {
+		t.Fatalf("restart changed the mirror: row %+v, archives %v, state %v", got, board.archives, m.state)
 	}
 	m.pass(context.Background())
-	if len(board.replaces) != 1 {
-		t.Errorf("reconnected more than once in one run: %v", board.replaces)
+	if got := strings.Join(board.pins, ","); got != "l1=waiting,l1=working" {
+		t.Errorf("pins = %s", got)
 	}
 
 	// The host drops off: the row stays, marked.
@@ -199,45 +179,50 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	if len(board.archives) != archived {
 		t.Errorf("archived %v while the host was unreachable", board.archives[archived:])
 	}
-	if ui.badges["l2"] != "✕ mini offline" {
-		t.Errorf("badge = %q", ui.badges["l2"])
+	if ui.badges["l1"] != "✕ mini offline" {
+		t.Errorf("badge = %q", ui.badges["l1"])
 	}
 
-	// It comes back without the session: the mirror goes. (l1 went when l2
-	// replaced it.)
+	// It comes back without the session: the mirror goes.
 	reply["mini"] = snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{}}
 	m.pass(context.Background())
-	if strings.Join(board.archives, ",") != "l1,l2" {
+	if strings.Join(board.archives, ",") != "l1" {
 		t.Errorf("archives = %v", board.archives)
 	}
 }
 
-// Killing a mirror is how the operator reconnects it: the next pass
-// replaces it in its own place and follows the new row.
-func TestPassReconnectsAKilledMirrorInPlace(t *testing.T) {
-	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
-	board := newFakeBoard()
-	reply := hosts{"mini": snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{live("a1", "waiting")}}}
-	m := newMirrors(cfg, board, nil, quiet(), reply.run, machineStore(t, t.TempDir(), mini))
-	m.pass(context.Background())
-	board.mu.Lock()
-	killed := board.sessions["l1"]
-	killed.Running = false
-	board.sessions["l1"] = killed
-	board.mu.Unlock()
-	m.pass(context.Background())
-	if strings.Join(board.replaces, ";") != "l1 mini a1 group= name=" {
-		t.Fatalf("replaces = %q, want l1 replaced with the same attach and no group or name", board.replaces)
-	}
-	if m.state.Mirrors["mini/a1"] != "l2" || board.pins[len(board.pins)-1] != "l2=waiting" {
-		t.Errorf("state = %v, pins = %v; want the new row l2 followed and pinned", m.state.Mirrors, board.pins)
-	}
-	if strings.Join(board.archives, ",") != "l1" {
-		t.Errorf("archives = %v, want the replaced row l1 archived at once", board.archives)
-	}
-	m.pass(context.Background())
-	if len(board.replaces) != 1 || len(board.launches) != 1 {
-		t.Errorf("a running replacement was replaced or launched again: %v %v", board.replaces, board.launches)
+func TestPassPinsTheSameMirrorAfterStockRevive(t *testing.T) {
+	for _, observeDead := range []bool{true, false} {
+		t.Run(fmt.Sprintf("observed dead=%v", observeDead), func(t *testing.T) {
+			cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
+			board := newFakeBoard()
+			reply := hosts{"mini": snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{live("a1", "waiting")}}}
+			m := newMirrors(cfg, board, nil, quiet(), reply.run, machineStore(t, t.TempDir(), mini))
+			ctx := context.Background()
+			m.pass(ctx)
+			first := board.sessions["l1"]
+			if observeDead {
+				dead := first
+				dead.Running, dead.Status = false, "dead"
+				board.sessions["l1"] = dead
+				m.pass(ctx)
+				m.pass(ctx)
+				if board.sessions["l1"] != dead || len(board.pins) != 1 {
+					t.Fatalf("reconcile changed a killed mirror: %v, pins %v", board.sessions, board.pins)
+				}
+			}
+			revived := first
+			revived.Status = "starting"
+			board.sessions["l1"] = revived
+			m.pass(ctx)
+			m.pass(ctx)
+			if len(board.launches) != 1 || len(board.archives) != 0 || m.state.Mirrors["mini/a1"] != "l1" {
+				t.Fatalf("reconcile changed the row: launches %v, archives %v, state %v", board.launches, board.archives, m.state)
+			}
+			if got := strings.Join(board.pins, ","); got != "l1=waiting,l1=waiting" {
+				t.Errorf("pins = %s", got)
+			}
+		})
 	}
 }
 

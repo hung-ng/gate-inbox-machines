@@ -2,7 +2,6 @@ package machines
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,8 +19,8 @@ import (
 // It is not a SpawnPolicy, though a spawn onto the mirror tool from the
 // new-session picker is just as useless: the board fails a policy closed, so
 // a mistake in [extensions.machines] would stop every spawn on the board,
-// local agents included. That spawn already ends at once with a note saying
-// to pick an agent CLI (see runAttach).
+// local agents included. That pane already explains why it has no
+// target and waits (see runAttach).
 func (e *Extension) LaunchEnv(_ context.Context, l extension.Launch) (map[string]string, error) {
 	if l.Session.Role == mirrorRole && l.Session.Tool != toolName {
 		return nil, fmt.Errorf("a mirror must keep the mirror tool; use N to start an agent on another machine")
@@ -33,23 +32,15 @@ func (e *Extension) LaunchEnv(_ context.Context, l extension.Launch) (map[string
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(dir, stateFile))
+	saved, err := readState(filepath.Join(dir, stateFile))
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	var saved state
-	if err := json.Unmarshal(data, &saved); err != nil {
-		return nil, err
-	}
-	for _, rows := range []map[string]string{saved.Mirrors, saved.Dismissed} {
-		for _, id := range rows {
-			if id == l.From {
-				return nil, fmt.Errorf("a mirror cannot move to a local agent; use N to start an agent on that machine")
-			}
-		}
+	if saved.target(l.From) != "" {
+		return nil, fmt.Errorf("a mirror cannot move to a local agent; use N to start an agent on that machine")
 	}
 	return nil, nil
 }

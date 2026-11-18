@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -123,5 +125,45 @@ func TestRunAttachDropsTheEmptyPromptAndChecksItsOperands(t *testing.T) {
 		if err := e.runAttach(context.Background(), args, nil); err == nil {
 			t.Errorf("attach %q ran, want an error", args)
 		}
+	}
+}
+
+func TestRunAttachFindsActiveOrDismissedMirrorByRowID(t *testing.T) {
+	for _, field := range []string{"mirrors", "dismissed"} {
+		t.Run(field, func(t *testing.T) {
+			e := newManaged(t, healthyFar(), mini)
+			t.Setenv("GATE_INBOX_SESSION_ID", "abcd")
+			dir, err := e.conf.DataDir()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, stateFile), []byte(`{"`+field+`":{"mini/ab12":"abcd"}}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var argv []string
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			e.attach = func(_ context.Context, a []string) (int, error) { argv = a; cancel(); return 0, nil }
+			if err := e.runAttach(ctx, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if len(argv) == 0 || argv[len(argv)-1] != "exec tmux -u attach-session -t '=gi_ab12'" {
+				t.Fatalf("attach ran %q", argv)
+			}
+		})
+	}
+}
+
+func TestRunAttachWaitsForMissingMirrorMapping(t *testing.T) {
+	e := newManaged(t, healthyFar(), mini)
+	t.Setenv("GATE_INBOX_SESSION_ID", "abcd")
+	e.attach = func(context.Context, []string) (int, error) {
+		t.Fatal("attach ran without a mapping")
+		return 0, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := e.runAttach(ctx, nil, nil); err != nil || ctx.Err() != context.DeadlineExceeded {
+		t.Fatalf("attach returned before cancellation: %v, context %v", err, ctx.Err())
 	}
 }

@@ -439,26 +439,60 @@ func TestPollHostTriesTheLoginShellOnce(t *testing.T) {
 	}
 }
 
-func TestPassPutsAwayAPausedMachinesMirrors(t *testing.T) {
-	dir := t.TempDir()
+func TestPassKeepsPausedMirrorsAndDismissalsUntilRemove(t *testing.T) {
 	b := newFakeBoard()
-	replies := hosts{"mini": snapshot{Version: wireVersion, BoardRunning: boolPtr(true), Sessions: []machineSession{live("a1", "waiting")}}}
+	u := &fakeUI{badges: map[string]string{}, facts: map[string]string{}}
+	waiting := live("a1", "waiting")
+	replies := hosts{"mini": seen(mini, waiting, live("b2", "idle")).Snapshot}
 	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
-	m := newMirrors(cfg, b, nil, quiet(), replies.run, machineStore(t, dir, mini))
-	m.pass(context.Background())
-	if len(b.launches) != 1 || len(b.archives) != 0 {
-		t.Fatal(b.launches, b.archives)
+	polls := 0
+	run := func(ctx context.Context, argv []string) ([]byte, error) {
+		polls++
+		return replies.run(ctx, argv)
 	}
-	m.reg.change(func(s *storeFile) error {
+	m := newMirrors(cfg, b, u, quiet(), run, machineStore(t, t.TempDir(), mini))
+	ctx := context.Background()
+	m.pass(ctx)
+	archived := b.sessions["l2"]
+	archived.Archived, archived.Running = true, false
+	b.sessions["l2"] = archived
+	m.pass(ctx)
+	before := m.state
+	if before.Dismissed["mini/b2"] != "l2" {
+		t.Fatal(before)
+	}
+	if err := m.reg.change(func(s *storeFile) error {
 		s.Paused = append(s.Paused, "mini")
 		return nil
-	})
-	m.pass(context.Background())
-	if !slices.Contains(b.archives, "l1") {
-		t.Fatal("a paused machine kept its mirror", b.archives)
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if len(m.state.Dismissed) != 0 {
-		t.Fatal("a paused machine's mirrors are not the operator's dismissals", m.state)
+	m.pass(ctx)
+	if len(b.archives) != 0 || len(b.launches) != 2 || polls != 2 || !sameState(m.state, before) {
+		t.Fatal(b.archives, b.launches, polls, m.state)
+	}
+	if b.sessions["l1"].Status != "waiting" || !u.owned["l1"] || u.badges["l1"] != "Ⅱ mini paused" || !strings.Contains(u.facts["l1"], "polling paused") {
+		t.Fatal(b.sessions["l1"], u.owned, u.badges, u.facts)
+	}
+	if err := m.reg.change(func(s *storeFile) error {
+		s.Paused = nil
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(ctx)
+	if !sameState(m.state, before) || len(b.launches) != 2 || u.owned["l1"] || u.badges["l1"] != "" {
+		t.Fatal(m.state, b.launches, u.owned, u.badges)
+	}
+	if err := m.reg.change(func(s *storeFile) error {
+		delete(s.Machines, "mini")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(ctx)
+	if !slices.Equal(b.archives, []string{"l1"}) || !sameState(m.state, newState()) {
+		t.Fatal(b.archives, m.state)
 	}
 }
 

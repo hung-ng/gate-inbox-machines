@@ -310,7 +310,7 @@ func (v *machinesView) Key(k extension.ViewKey) bool {
 			h := *current.machine
 			done := "Resumed " + h.Name + "."
 			if !h.Paused {
-				done = "Paused " + h.Name + ". The board puts its mirrors away until you resume it."
+				done = "Paused " + h.Name + ". The board keeps its mirrors and stops polling it."
 			}
 			v.run("saving...", func() []extension.Line {
 				err := v.e.pauseMachine(h.Name, !h.Paused)

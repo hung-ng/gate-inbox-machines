@@ -31,6 +31,19 @@ func (s state) clone() state {
 	return next
 }
 
+// target finds the remote session for a local row, including one whose
+// restore has started before the next reconcile.
+func (s state) target(localID string) string {
+	for _, rows := range []map[string]string{s.Mirrors, s.Dismissed} {
+		for key, id := range rows {
+			if id == localID {
+				return key
+			}
+		}
+	}
+	return ""
+}
+
 func mirrorKey(hostName, id string) string { return hostName + "/" + id }
 
 func splitKey(key string) (hostName, id string) {
@@ -49,7 +62,6 @@ type actionKind int
 
 const (
 	actLaunch actionKind = iota
-	actRelaunch
 	actPin
 	actArchive
 )
@@ -59,10 +71,10 @@ type action struct {
 	Key     string
 	Host    host
 	Session machineSession
-	// LocalID is the mirror a pin, a relaunch or an archive is for.
+	// LocalID is the mirror a pin or an archive is for.
 	LocalID string
 	Status  string
-	// Why is a relaunch's or an archive's reason, for the board's log.
+	// Why is an archive's reason, for the board's log.
 	Why string
 }
 
@@ -76,13 +88,9 @@ type action struct {
 // its mirrors as they were until it answers again, rather than having
 // them archived and launched again around a blip.
 //
-// pinned is the status each mirror was last pinned to, so an unchanged
-// status is not pinned again on every pass. current is the mirrors this
-// board's run launched or reconnected: a mirror from an earlier run is
-// reconnected once, so its pane runs this build with the settings the board
-// started with. That is what makes a restart the way to apply a changed
-// setting, whichever kill and archive keys the board's release has.
-func plan(prev state, configured []host, observed []observation, local map[string]extension.SessionInfo, pinned map[string]string, current map[string]bool) ([]action, state) {
+// pinned records successful pins for the current pane. The board can
+// reset a row's status when it revives between polls.
+func plan(prev state, configured []host, observed []observation, local map[string]extension.SessionInfo, pinned map[string]string) ([]action, state) {
 	next := prev.clone()
 	var actions []action
 
@@ -118,36 +126,31 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 		}
 	}
 
-	// A machine removed or paused takes its mirrors with it.
-	known := map[string]bool{}
+	// Removing a machine puts its mirrors away. A paused machine is still configured.
+	known := map[string]host{}
 	for _, h := range configured {
-		known[h.Name] = true
+		known[h.Name] = h
 	}
 	for _, key := range sortedKeys(next.Mirrors) {
-		if hostName, _ := splitKey(key); !known[hostName] {
-			actions = append(actions, action{Kind: actArchive, Key: key, LocalID: next.Mirrors[key], Why: "its machine was removed or paused"})
+		hostName, _ := splitKey(key)
+		if _, ok := known[hostName]; !ok {
+			actions = append(actions, action{Kind: actArchive, Key: key, LocalID: next.Mirrors[key], Why: "its machine was removed"})
 			delete(next.Mirrors, key)
 		}
 	}
 	for _, key := range sortedKeys(next.Dismissed) {
-		if hostName, _ := splitKey(key); !known[hostName] {
+		hostName, _ := splitKey(key)
+		if _, ok := known[hostName]; !ok {
 			delete(next.Dismissed, key)
 		}
 	}
 
 	for _, obs := range observed {
-		if obs.Err != nil {
-			// Errored keeps a transport failure visible in every layout. It is a
-			// stand-in for unavailable status, not a claim about the agent.
-			actions = append(actions, pinRest(obs.Host.Name, next, local, pinned, nil)...)
+		if h, ok := known[obs.Host.Name]; !ok || h.Paused || obs.Err != nil {
 			continue
 		}
-		// A machine whose board stopped still answers, and its tmux says
-		// which sessions a mirror can attach to right now. Those get a row,
-		// so an agent started with N while that board is down can still be
-		// opened from here. Its status can't be trusted with no board
-		// reading its pane, so every row is pinned to errored as a
-		// stand-in, and decorate owns it, keeping it out of triage.
+		// A stopped board can still report attachable panes. Its saved
+		// status and session list cannot tell us what to pin or archive.
 		stopped := !obs.Snapshot.boardRunning()
 		live := map[string]machineSession{}
 		for _, s := range obs.Snapshot.Sessions {
@@ -157,27 +160,14 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 		}
 		for _, id := range sortedKeys(live) {
 			s := live[id]
-			if stopped {
-				s.Status = "errored"
-			}
 			key := mirrorKey(obs.Host.Name, id)
 			if localID, ok := next.Mirrors[key]; ok {
-				// A mirror's attach never ends on its own, so a pane that has
-				// ended while its session still runs was killed from the board,
-				// on a release whose kill keeps the row. It comes back in its
-				// own place, as does a mirror from an earlier run of the board.
-				why := ""
-				switch {
-				case !local[localID].Running:
-					why = "its pane ended"
-				case !current[localID]:
-					why = "the board started"
-				}
-				if why != "" {
-					actions = append(actions, action{Kind: actRelaunch, Key: key, Host: obs.Host, Session: s, LocalID: localID, Status: pinStatus(s.Status), Why: why})
-					continue
-				}
-				if want := pinStatus(s.Status); pinned[localID] != want {
+				row := local[localID]
+				want := pinStatus(s.Status)
+				// Stock shows acknowledged finishes as idle. Leave that
+				// alone until we see the pane end or the remote status change.
+				reset := row.Status != want && !(want == "finished" && row.Status == "idle")
+				if !stopped && row.Running && (pinned[localID] != want || reset) {
 					actions = append(actions, action{Kind: actPin, Key: key, LocalID: localID, Status: want})
 				}
 				continue
@@ -185,12 +175,13 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 			if _, dismissed := next.Dismissed[key]; dismissed {
 				continue
 			}
-			actions = append(actions, action{Kind: actLaunch, Key: key, Host: obs.Host, Session: s, Status: pinStatus(s.Status)})
+			a := action{Kind: actLaunch, Key: key, Host: obs.Host, Session: s}
+			if !stopped {
+				a.Status = pinStatus(s.Status)
+			}
+			actions = append(actions, a)
 		}
 		if stopped {
-			// A stopped board's saved sessions are not enough to end a
-			// mirror on: the rest stay as they are until the board is back.
-			actions = append(actions, pinRest(obs.Host.Name, next, local, pinned, live)...)
 			continue
 		}
 		prefix := obs.Host.Name + "/"
@@ -215,23 +206,6 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 		}
 	}
 	return actions, next
-}
-
-// pinRest pins to errored each running mirror of hostName's that is not in
-// skip, for a machine whose status can't be read.
-func pinRest(hostName string, next state, local map[string]extension.SessionInfo, pinned map[string]string, skip map[string]machineSession) []action {
-	var actions []action
-	for _, key := range sortedKeys(next.Mirrors) {
-		id := next.Mirrors[key]
-		name, _ := splitKey(key)
-		if name != hostName || isLive(key, skip) {
-			continue
-		}
-		if local[id].Running && pinned[id] != "errored" {
-			actions = append(actions, action{Kind: actPin, Key: key, LocalID: id, Status: "errored"})
-		}
-	}
-	return actions
 }
 
 func isLive(key string, live map[string]machineSession) bool {

@@ -22,9 +22,9 @@ questions. This extension adds two things to the same build:
 Every reply also says where that machine keeps `gate-inbox` and tmux, which tmux server its board
 uses, and which build it runs. Your board uses those, so a machine needs only an SSH destination.
 
-When you select a mirror, Gate Inbox reads the mirror's pane for the preview. A live dialog
-should still appear as a card. Expect the conversation area to say "No user-facing messages yet".
-Enter opens the remote terminal so you can answer there, including when triage hands you the row.
+On stock Gate Inbox v1.1.0, a waiting mirror can show "No user-facing messages yet" in the
+list preview while a permission dialog is open in the pane. Enter opens the remote terminal
+so you can see and answer it, including when triage hands you the row.
 
 The extension uses the public APIs in stock Gate Inbox v1.1.0.
 
@@ -124,7 +124,7 @@ stopped, offline since a time and why, or paused. Under it are suggestions to ad
 | `a` | Add a machine. On a suggestion, the form starts with its destination |
 | `enter` | Check the machine under the cursor, or add the suggestion |
 | `c` | Check the machine and show each step |
-| `space` | Pause or resume. The board stops polling a paused machine and puts its mirrors away until it resumes |
+| `space` | Pause or resume. The board stops polling a paused machine and keeps its mirrors |
 | `d` | Remove, after a second `d`. The board puts its mirrors away, and its agents keep running |
 | `n` | Start a session there, as `N` on the list does |
 | `esc`, `q` | Close |
@@ -205,8 +205,7 @@ These keys go directly under `[extensions.machines]` in `config.toml`.
 | `discover` | none | A command whose output becomes suggestions (see above) |
 
 The build supplies the `[tools.mirror]` block that mirrors launch with. It shows in the
-new-session picker. Starting it from there only prints a note saying to pick
-an agent CLI, and `machines sessions` never reports such a session. Uncheck it under Settings →
+new-session picker. Starting it from there leaves a pane waiting for a mirror target, and `machines sessions` never reports such a session. Uncheck it under Settings →
 CLIs to hide it.
 
 A machine's polls and mirrors share one SSH connection. It closes 10 minutes after the last of
@@ -218,35 +217,26 @@ them stops.
   `mini-upgrade-http-client`, since the board's main list shows a row's name and tool but not its
   badges. Healthy mirrors have no badge. The detail panel has a `machine` line such as
   `mini · claude · waiting · gi_ab12`.
-- When a machine can't be reached, its running mirrors are pinned to `errored`, with a
-  `✕ mini offline` badge and a detail line giving the time it became unreachable. This is a
-  stand-in status that keeps the connection problem visible in every layout, not a claim that
-  the agent failed. The extension owns those rows so they stay out of triage, the attention
-  filter and Tab jumps. Nothing is archived or relaunched until the machine answers again.
-- A reachable machine whose board stopped shows its sessions anyway, so an agent started with `N`
-  while that board is down can still be opened from here. Its rows are pinned to `errored` with a
-  `✕ mini board stopped` badge and a detail line saying there's no status until you start that
-  machine's board. They stay out of triage like an offline machine's rows. Agent processes can
-  keep running after their board quits, but their saved statuses cannot be trusted. So a row
-  appears for each session that machine's tmux says a mirror can attach to right now, and no row
-  is put away until the board is back. That machine's `machines sessions` tells whether its board
-  runs by checking that the process whose PID is in its board's `manager.lock` is alive. It never
-  takes that lock, which could make a board starting at the same moment take over from a live one.
-  A reply from an older build without this check reads as running. When the board is back, the
-  rows get their real status again.
+- Offline, stopped and paused machines keep their mirror rows and last reported statuses.
+  A badge and the detail panel show why the status stopped updating. The extension keeps
+  those rows out of triage, the attention filter and Tab jumps. Pausing stops polls
+  and keeps dismissals. Removing a machine archives its mirrors.
+- A reachable machine whose board stopped can still report panes that tmux can attach to.
+  An agent started with `N` while that board is down can appear with the mirror tool's default
+  status until polling gets live status again. The extension waits for a running board before
+  treating an absent session as ended. The far machine reports board liveness by checking the
+  PID in `manager.lock`. Replies from older builds without this check read as running.
 - If a mirror can't attach, its pane says why (the connection dropped, no tmux on the PATH, tmux
   refused the target) and tries again with backoff (1s, 2s, 4s, up to 30s). The row stays, and the
   board's log names the reason once. A mirror's pane never exits on its own: a pane whose command
   exits is left on a local shell, which triage would hand you as if it were the agent on the other
   machine. If the tmux client on that machine is detached, the mirror attaches again half a second
   later.
-- Restarting the board reconnects every mirror in its own row, keeping its name and priority, so
-  the panes pick up any setting you changed.
-- Archiving a mirror puts it away until its session stops running on its machine. On Gate Inbox
-  v1.1.0, `ctrl+x` kills and archives a session, so it puts a mirror away too. Restoring the
-  mirror from the archive brings it back.
-- The board's log records each mirror the extension starts, reconnects, archives or sees put away,
-  with the reason.
+- Restarting the board leaves mirror panes running. A killed mirror stays dead until you revive
+  it with `v`. Gate Inbox revives the same row and the mirror finds its target by row ID.
+- An archived mirror stays away until its session stops running on its machine or you restore
+  it from the archive. Revive and restore use the mapping in `mirrors.json`. If it is missing,
+  the pane explains the problem and waits for a target while it is open.
 
 ## Using it
 
@@ -262,7 +252,8 @@ them stops.
   row in the archive. The agent on the other machine keeps running. The confirm prompt is Gate
   Inbox's own and still reads "kill <row>?", about freeing its RAM; for a mirror only the local
   row and its ssh connection close. To get the mirror back, open the archived view from the `:`
-  menu, press `u` on its row, then confirm with `y` or Enter.
+  menu, press `u` on its row, then confirm with `y` or Enter. For a dead row still on the
+  active list, press `v` to revive it.
 
 ## Start a session on another machine
 
@@ -348,8 +339,7 @@ sequences, which is left as future work.
   too, as a mirror has no conversation here. Use `N` to start an agent on that machine.
 - A session started by another session on its machine shows here as its own top-level row, not
   under its parent. The extension API can file a new row under a parent but can't move a row later,
-  and a parent reconnected on restart would leave its children under the old row. Keeping the
-  layout needs a way to move a row.
+  and the layout would need to handle children whose parent is missing.
 - Only sessions the machine's board launched are mirrored: each has a `gi_<id>` tmux session to
   attach to. A pane the board adopted as it was, started by hand inside some other tmux session,
   is left out, because attaching would bring that whole tmux session, other windows and all, into

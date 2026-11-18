@@ -24,7 +24,6 @@ type boardOps interface {
 	Launch(ctx context.Context, req extension.LaunchRequest) (extension.SessionInfo, error)
 	PinStatus(ctx context.Context, id, status string) error
 	Archive(ctx context.Context, id string) error
-	Replace(ctx context.Context, id string, req extension.LaunchRequest, opts ...extension.ReplaceOptions) (extension.SessionInfo, extension.ReplaceHandle, error)
 }
 
 // runner runs one command and returns what it printed. Tests swap it for
@@ -72,13 +71,11 @@ type mirrors struct {
 	badges    map[string]string
 	lastErr   map[string]string
 	skipped   map[string]int
-	// current is the mirrors this run of the board launched or reconnected.
-	current map[string]bool
-	wake    <-chan string
-	since   map[string]time.Time
-	stopped map[string]bool
-	owned   map[string]bool
-	tools   *toolCache
+	wake      <-chan string
+	since     map[string]time.Time
+	stopped   map[string]bool
+	owned     map[string]bool
+	tools     *toolCache
 	// reg is where the machines come from, read again every pass so one
 	// added or paused from a shell shows up without a restart.
 	reg *registry
@@ -103,7 +100,6 @@ func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logge
 		badges:  map[string]string{},
 		lastErr: map[string]string{},
 		skipped: map[string]int{},
-		current: map[string]bool{},
 		since:   map[string]time.Time{},
 		stopped: map[string]bool{},
 		owned:   map[string]bool{},
@@ -146,9 +142,15 @@ func (m *mirrors) pass(ctx context.Context) {
 		m.log.Warn("could not list the board's mirrors", "err", err)
 		return
 	}
-	actions, next := plan(m.state, hosts, observed, local, m.pinned, m.current)
+	for id := range m.pinned {
+		if !local[id].Running {
+			delete(m.pinned, id)
+		}
+	}
+	actions, next := plan(m.state, m.reg.all(), observed, local, m.pinned)
 	for _, key := range sortedKeys(next.Dismissed) {
 		if _, before := m.state.Dismissed[key]; !before {
+			m.forget(next.Dismissed[key])
 			m.log.Info("a mirror was archived from the board; it stays away until its session stops running", "key", key)
 		}
 	}
@@ -165,41 +167,9 @@ func (m *mirrors) pass(ctx context.Context) {
 			} else {
 				m.log.Info("archived a mirror", "session", a.LocalID, "key", a.Key, "why", a.Why)
 			}
-			delete(m.pinned, a.LocalID)
-			delete(m.badges, a.LocalID)
-			delete(m.owned, a.LocalID)
-			delete(m.current, a.LocalID)
+			m.forget(a.LocalID)
 		case actPin:
 			m.pin(ctx, a.LocalID, a.Status)
-		case actRelaunch:
-			if until, ok := m.failed[a.Key]; ok && m.now().Before(until) {
-				continue
-			}
-			// Replace keeps the row's place, name and priority. A replacement
-			// takes its predecessor's group, so the request names none.
-			req := launchRequest(a.Host, a.Session)
-			req.Group, req.Name = "", ""
-			info, _, err := m.board.Replace(ctx, a.LocalID, req)
-			if err != nil {
-				m.failed[a.Key] = m.now().Add(launchBackoff)
-				m.log.Warn("could not reconnect a mirror", "key", a.Key, "session", a.LocalID, "err", err)
-				continue
-			}
-			delete(m.failed, a.Key)
-			delete(m.pinned, a.LocalID)
-			delete(m.badges, a.LocalID)
-			delete(m.owned, a.LocalID)
-			delete(m.current, a.LocalID)
-			m.current[info.ID] = true
-			next.Mirrors[a.Key] = info.ID
-			m.log.Info("reconnected a mirror", "key", a.Key, "was", a.LocalID, "session", info.ID, "why", a.Why)
-			m.pin(ctx, info.ID, a.Status)
-			// Replace leaves the old row dead with its last screen kept, for a
-			// revive. A mirror has nothing to revive, so the old row goes now
-			// rather than lingering as a second, dead copy of the session.
-			if err := m.board.Archive(ctx, a.LocalID); err != nil {
-				m.log.Warn("could not archive the mirror a reconnect replaced", "session", a.LocalID, "err", err)
-			}
 		case actLaunch:
 			if until, ok := m.failed[a.Key]; ok && m.now().Before(until) {
 				continue
@@ -211,10 +181,11 @@ func (m *mirrors) pass(ctx context.Context) {
 				continue
 			}
 			delete(m.failed, a.Key)
-			m.current[info.ID] = true
 			next.Mirrors[a.Key] = info.ID
 			m.log.Info("mirroring a session", "key", a.Key, "session", info.ID, "name", info.Name)
-			m.pin(ctx, info.ID, a.Status)
+			if a.Status != "" {
+				m.pin(ctx, info.ID, a.Status)
+			}
 		}
 	}
 	if !sameState(m.state, next) {
@@ -224,6 +195,15 @@ func (m *mirrors) pass(ctx context.Context) {
 	}
 	m.state = next
 	m.decorate(observed, local)
+}
+
+func (m *mirrors) forget(id string) {
+	if m.ui != nil && m.owned[id] {
+		m.ui.Own(id, false)
+	}
+	delete(m.pinned, id)
+	delete(m.badges, id)
+	delete(m.owned, id)
 }
 
 func (m *mirrors) pin(ctx context.Context, id, status string) {
@@ -422,13 +402,17 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 		id := m.state.Mirrors[key]
 		hostName, sessionID := splitKey(key)
 		badge := extension.Badge{}
-		owned := !reachable[hostName] || stopped[hostName]
+		machine, _ := m.reg.host(hostName)
+		owned := machine.Paused || !reachable[hostName] || stopped[hostName]
 		if m.owned[id] != owned {
 			m.ui.Own(id, owned)
 		}
 		m.owned[id] = owned
 		fact := hostName + " · " + tools[key] + " · " + status[key] + " · gi_" + sessionID
 		switch {
+		case machine.Paused:
+			badge = extension.Badge{Text: "Ⅱ " + hostName + " paused", Short: "Ⅱ", Tone: extension.ToneWarn}
+			fact = hostName + " · polling paused · gi_" + sessionID
 		case !reachable[hostName]:
 			badge = extension.Badge{Text: "✕ " + hostName + " offline", Short: "✕", Tone: extension.ToneBad}
 			fact = hostName + " · unreachable since " + m.since[hostName].Format("15:04") + " · gi_" + sessionID
@@ -455,18 +439,11 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 }
 
 func (m *mirrors) load() state {
-	st := newState()
-	data, err := os.ReadFile(m.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return st
-	}
-	if err == nil {
-		err = json.Unmarshal(data, &st)
-	}
+	st, err := readState(m.path)
 	if err != nil {
-		// A state file that cannot be read is started over: its mirrors are
-		// archived as rows nothing names, and launched again.
-		m.log.Warn("could not read the mirror state; starting over", "path", m.path, "err", err)
+		if !errors.Is(err, os.ErrNotExist) {
+			m.log.Warn("could not read the mirror state; starting over", "path", m.path, "err", err)
+		}
 		return newState()
 	}
 	if st.Mirrors == nil {
@@ -476,6 +453,16 @@ func (m *mirrors) load() state {
 		st.Dismissed = map[string]string{}
 	}
 	return st
+}
+
+func readState(path string) (state, error) {
+	var st state
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return st, err
+	}
+	err = json.Unmarshal(data, &st)
+	return st, err
 }
 
 // save writes the state by rename, so a reader never sees half a file.

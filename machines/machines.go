@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 
@@ -168,7 +169,7 @@ func (e *Extension) StartBoard(ctx context.Context, board extension.BoardHost) (
 
 const (
 	usageSessions = "machines sessions [--tmux <path>] [--tmux-socket <name>] [--json]"
-	usageAttach   = "machines attach <machine> <session-id>"
+	usageAttach   = "machines attach [<machine> <session-id>]"
 	usageCheck    = "machines check [<machine>...]"
 
 	usageAdd    = "machines add [--name <name>] [--group <group>] [--home <dir>] [--gate-inbox <path>] [--force] <destination>"
@@ -281,17 +282,38 @@ func (e *Extension) runAttach(ctx context.Context, args []string, host extension
 	// The board launches the tool with its prompt ahead of these arguments,
 	// and a mirror has none, so an empty word may lead them.
 	args = slices.DeleteFunc(slices.Clone(args), func(a string) bool { return a == "" })
+	var hostName, id string
 	if len(args) == 0 {
-		// The machines tool is in the new-session picker like any other,
-		// and picking it starts this with nothing to attach to.
-		return errors.New("the machines tool is how this board shows your other machines' sessions, and the board launches it for each one; start an agent CLI instead")
+		// Stock revive and restore keep the row ID but omit launch Args.
+		localID := os.Getenv("GATE_INBOX_SESSION_ID")
+		if localID == "" {
+			fmt.Fprintln(os.Stderr, "No Gate Inbox row ID. Use machines attach <machine> <session-id> to attach from a terminal.")
+			<-ctx.Done()
+			return nil
+		}
+		var lastError string
+		for {
+			target, err := e.savedMirrorTarget(localID)
+			if err == nil {
+				hostName, id = splitKey(target)
+				break
+			}
+			if msg := err.Error(); msg != lastError {
+				fmt.Fprintf(os.Stderr, "[gate-inbox machines] %s. Waiting for the saved mirror target.\r\n", msg)
+				lastError = msg
+			}
+			if err := sleepCtx(ctx, firstRetry); err != nil {
+				return nil
+			}
+		}
+	} else {
+		set := cmdline.NewFlagSet(usageAttach)
+		operands, err := cmdline.Parse(os.Stdout, program, set, args, 2, 2)
+		if err != nil {
+			return err
+		}
+		hostName, id = operands[0], operands[1]
 	}
-	set := cmdline.NewFlagSet(usageAttach)
-	operands, err := cmdline.Parse(os.Stdout, program, set, args, 2, 2)
-	if err != nil {
-		return err
-	}
-	hostName, id := operands[0], operands[1]
 	h, ok := e.machines().host(hostName)
 	if !ok {
 		return fmt.Errorf("no machine %q: add it with `gate-inbox machines add`", hostName)
@@ -307,11 +329,33 @@ func (e *Extension) runAttach(ctx context.Context, args []string, host extension
 			host.Logger().Warn("a mirror cannot attach", "machine", hostName, "session", id, "code", code, "err", msg)
 		}
 	}
-	err = attachLoop(ctx, os.Stderr, e.attach, attachArgv(e.cfg, h, id), hostName, id, sleepCtx, note)
+	err := attachLoop(ctx, os.Stderr, e.attach, attachArgv(e.cfg, h, id), hostName, id, sleepCtx, note)
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
 	return err
+}
+
+func (e *Extension) savedMirrorTarget(localID string) (string, error) {
+	dir, err := e.conf.DataDir()
+	if err != nil {
+		return "", err
+	}
+	saved, err := readState(filepath.Join(dir, stateFile))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("could not read %s: %w", stateFile, err)
+	}
+	key := saved.target(localID)
+	name, id := splitKey(key)
+	if name == "" || !sessionIDPattern.MatchString(id) {
+		return "", fmt.Errorf("no target in %s for row %s", stateFile, localID)
+	}
+	reg := e.machines()
+	reg.reload()
+	if _, ok := reg.host(name); !ok {
+		return "", fmt.Errorf("machine %q is missing from %s", name, storeFileName)
+	}
+	return key, nil
 }
 
 // The board finds each capability by asking for its interface, so a

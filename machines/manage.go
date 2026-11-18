@@ -238,7 +238,7 @@ func (e *Extension) runPause(args []string, pause bool) error {
 		return err
 	}
 	if pause {
-		fmt.Printf("Paused %s. A running board puts its mirrors away and stops polling it.\n", operands[0])
+		fmt.Printf("Paused %s. A running board keeps its mirrors and stops polling it.\n", operands[0])
 	} else {
 		fmt.Printf("Resumed %s.\n", operands[0])
 	}

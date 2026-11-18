@@ -43,11 +43,13 @@ func describe(actions []action) []string {
 	for _, a := range actions {
 		switch a.Kind {
 		case actLaunch:
-			out = append(out, fmt.Sprintf("launch %s as %s", a.Key, a.Status))
+			line := "launch " + a.Key
+			if a.Status != "" {
+				line += " as " + a.Status
+			}
+			out = append(out, line)
 		case actPin:
 			out = append(out, fmt.Sprintf("pin %s %s", a.LocalID, a.Status))
-		case actRelaunch:
-			out = append(out, fmt.Sprintf("relaunch %s for %s as %s", a.LocalID, a.Key, a.Status))
 		case actArchive:
 			out = append(out, "archive "+a.LocalID)
 		}
@@ -65,14 +67,11 @@ func withMirrors(pairs ...string) state {
 
 func TestPlan(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		prev     state
-		observed []observation
-		local    map[string]extension.SessionInfo
-		pinned   map[string]string
-		// current is the mirrors this board run launched; nil means every
-		// row in local, the usual case within one run.
-		current       map[string]bool
+		name          string
+		prev          state
+		observed      []observation
+		local         map[string]extension.SessionInfo
+		pinned        map[string]string
 		want          []string
 		wantMirrors   map[string]string
 		wantDismissed []string
@@ -107,7 +106,14 @@ func TestPlan(t *testing.T) {
 		name:        "an unchanged status is not pinned again",
 		prev:        withMirrors("mini/a1", "l1"),
 		observed:    []observation{seen(mini, live("a1", "delegating"))},
-		local:       rows(mirrorRow("l1", true)),
+		local:       rows(extension.SessionInfo{ID: "l1", Running: true, Status: "finished"}),
+		pinned:      map[string]string{"l1": "finished"},
+		wantMirrors: map[string]string{"mini/a1": "l1"},
+	}, {
+		name:        "an acknowledged finish stays idle",
+		prev:        withMirrors("mini/a1", "l1"),
+		observed:    []observation{seen(mini, live("a1", "finished"))},
+		local:       rows(extension.SessionInfo{ID: "l1", Running: true, Status: "idle"}),
 		pinned:      map[string]string{"l1": "finished"},
 		wantMirrors: map[string]string{"mini/a1": "l1"},
 	}, {
@@ -118,7 +124,6 @@ func TestPlan(t *testing.T) {
 		want:     []string{"archive l1"},
 	}, {
 		name:        "an unreachable host keeps its mirrors visible",
-		want:        []string{"pin l1 errored"},
 		prev:        withMirrors("mini/a1", "l1"),
 		observed:    []observation{unreachable(mini)},
 		local:       rows(mirrorRow("l1", true)),
@@ -139,20 +144,17 @@ func TestPlan(t *testing.T) {
 		}(),
 		observed: []observation{seen(mini)},
 	}, {
-		name:        "a mirror killed from the board comes back in its place",
+		name:        "a mirror killed from the board stays dead",
 		prev:        withMirrors("mini/a1", "l1"),
 		observed:    []observation{seen(mini, live("a1", "waiting"))},
 		local:       rows(mirrorRow("l1", false)),
-		want:        []string{"relaunch l1 for mini/a1 as waiting"},
 		wantMirrors: map[string]string{"mini/a1": "l1"},
 	}, {
-		name:        "a mirror from an earlier run of the board is reconnected once",
+		name:        "an existing running mirror keeps its local row",
 		prev:        withMirrors("mini/a1", "l1"),
 		observed:    []observation{seen(mini, live("a1", "waiting"))},
-		local:       rows(mirrorRow("l1", true)),
+		local:       rows(extension.SessionInfo{ID: "l1", Running: true, Status: "waiting"}),
 		pinned:      map[string]string{"l1": "waiting"},
-		current:     map[string]bool{},
-		want:        []string{"relaunch l1 for mini/a1 as waiting"},
 		wantMirrors: map[string]string{"mini/a1": "l1"},
 	}, {
 		name: "a mirror restored from the archive is followed again",
@@ -163,8 +165,7 @@ func TestPlan(t *testing.T) {
 		}(),
 		observed:    []observation{seen(mini, live("a1", "waiting"))},
 		local:       rows(mirrorRow("l1", true)),
-		current:     map[string]bool{},
-		want:        []string{"relaunch l1 for mini/a1 as waiting"},
+		want:        []string{"pin l1 waiting"},
 		wantMirrors: map[string]string{"mini/a1": "l1"},
 	}, {
 		name:     "a mirror row nothing names is archived",
@@ -184,20 +185,14 @@ func TestPlan(t *testing.T) {
 		observed:    []observation{seen(mini, live("a1", "idle")), unreachable(box)},
 		local:       rows(mirrorRow("l2", true)),
 		pinned:      map[string]string{"l2": "working"},
-		want:        []string{"launch mini/a1 as idle", "pin l2 errored"},
+		want:        []string{"launch mini/a1 as idle"},
 		wantMirrors: map[string]string{"box/b1": "l2"},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.local == nil {
 				tc.local = rows()
 			}
-			if tc.current == nil {
-				tc.current = map[string]bool{}
-				for id := range tc.local {
-					tc.current[id] = true
-				}
-			}
-			actions, next := plan(tc.prev, []host{mini, box}, tc.observed, tc.local, tc.pinned, tc.current)
+			actions, next := plan(tc.prev, []host{mini, box}, tc.observed, tc.local, tc.pinned)
 			if got := describe(actions); !slices.Equal(got, tc.want) {
 				t.Errorf("actions = %q, want %q", got, tc.want)
 			}

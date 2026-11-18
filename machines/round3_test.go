@@ -76,9 +76,9 @@ func TestMirrorMigrationGuards(t *testing.T) {
 func TestTwoMachinesKeepIndependentStatus(t *testing.T) {
 	prev := withMirrors("mini/a1", "aa", "box/b2", "bb")
 	local := rows(mirrorRow("aa", true), mirrorRow("bb", true))
-	acts, next := plan(prev, []host{mini, box}, []observation{unreachable(mini), seen(box, live("b2", "waiting"))}, local, map[string]string{"aa": "working", "bb": "working"}, map[string]bool{"aa": true, "bb": true})
+	acts, next := plan(prev, []host{mini, box}, []observation{unreachable(mini), seen(box, live("b2", "waiting"))}, local, map[string]string{"aa": "working", "bb": "working"})
 	got := strings.Join(describe(acts), ";")
-	if got != "pin aa errored;pin bb waiting" || !sameState(prev, next) {
+	if got != "pin bb waiting" || !sameState(prev, next) {
 		t.Fatal(got, next)
 	}
 }
