@@ -177,8 +177,11 @@ Starting the board from that Mac's own desktop session avoids it.
 ### Suggestions
 
 The machines screen suggests machines to add from two places. It leaves out any already on the
-board, by destination or by where `ssh -G` says it leads, and any discovered machine that reports
-the hostname of one already there:
+board: by destination, by where `ssh -G` says it leads, or because that host is the hostname a
+machine on the board reports, with or without `.local`. A Mac answers on its local network as
+`<hostname>.local`, and so do most Linux machines running Avahi, so an alias for a machine's LAN
+name is left out without connecting to it. A discovered machine that reports the hostname of one
+already there is left out too. Anything left out can still be typed into the add form:
 
 - **Hosts in `~/.ssh/config`**, and the files it includes. Patterns such as `*.example.com` are
   left out. The board doesn't connect to these until you pick one, since that file often names

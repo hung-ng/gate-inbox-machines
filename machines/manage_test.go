@@ -1080,3 +1080,47 @@ func TestAddFormPassesPathAndHomeToItsSetupRow(t *testing.T) {
 		t.Fatal(b.launches)
 	}
 }
+
+// A machine's local network name is its hostname with ".local", which is
+// enough to leave an alias for it out of the suggestions without
+// connecting to it.
+func TestSuggestionsLeaveOutALocalNameForAMachineOnTheBoard(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte("Host mini-lan mini-local-dot box-lan devbox\n"), 0o600)
+	far := healthyFar()
+	far.targets = map[string]string{
+		"mini.example.com": resolved("me", "mini.example.com", "22"),
+		"mini-lan":         resolved("me", "hung-mini.local", "22"),
+		"mini-local-dot":   resolved("me", "Hung-Mini.local.", "22"),
+		"box-lan":          resolved("me", "box.local", "22"),
+		"devbox":           resolved("me", "hung-mini.example.org", "22"),
+	}
+	mini := host{Name: "mini", Destination: "mini.example.com", GateInbox: "gate-inbox", Tmux: "tmux"}
+	e := newManaged(t, far, mini)
+	// macOS can report its hostname with ".local" on the end too.
+	e.reg.learn("mini", "mini.example.com", about{Hostname: "Hung-Mini.local"})
+	found, _ := e.suggestions(context.Background())
+	var got []string
+	for _, s := range found {
+		got = append(got, s.Destination)
+	}
+	if strings.Join(got, ",") != "box-lan,devbox" {
+		t.Fatal(got)
+	}
+}
+
+func TestShortHostname(t *testing.T) {
+	for in, want := range map[string]string{
+		"hung-mini": "hung-mini", "Hung-Mini.local": "hung-mini", "hung-mini.local.": "hung-mini",
+		"hung-mini.example.com": "hung-mini.example.com", "192.168.1.5": "192.168.1.5", "": "",
+	} {
+		if got := shortHostname(in); got != want {
+			t.Errorf("shortHostname(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := targetHost("me@hung-mini.local:22"); got != "hung-mini.local" {
+		t.Fatal(got)
+	}
+}

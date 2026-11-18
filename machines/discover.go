@@ -189,7 +189,7 @@ func (e *Extension) suggestions(ctx context.Context) ([]suggestion, string) {
 			known[target] = true
 		}
 		if h.About != nil && h.About.Hostname != "" {
-			hostnames[strings.ToLower(h.About.Hostname)] = true
+			hostnames[shortHostname(h.About.Hostname)] = true
 		}
 	}
 	// fresh is whether d is not on the board, by its destination or by
@@ -207,7 +207,12 @@ func (e *Extension) suggestions(ctx context.Context) ([]suggestion, string) {
 			return false
 		}
 		known[target] = true
-		return true
+		// A Mac answers on its local network as <hostname>.local, and so
+		// do most Linux machines running Avahi, so a host that resolves to
+		// the hostname a machine on the board reports is that machine.
+		// This is only a suggestion left out: the destination can still be
+		// typed into the add form.
+		return !hostnames[shortHostname(targetHost(target))]
 	}
 	var out []suggestion
 	problem := ""
@@ -225,7 +230,7 @@ func (e *Extension) suggestions(ctx context.Context) ([]suggestion, string) {
 	// A probed machine that reports the hostname of one on the board is
 	// that machine by another address, such as its LAN one.
 	for _, s := range probed {
-		if s.Hostname == "" || !hostnames[strings.ToLower(s.Hostname)] {
+		if s.Hostname == "" || !hostnames[shortHostname(s.Hostname)] {
 			out = append(out, s)
 		}
 	}
@@ -269,6 +274,24 @@ func (e *Extension) sshTarget(ctx context.Context, destination string) (string, 
 		return "", false
 	}
 	return user + "@" + hostname + ":" + port, true
+}
+
+// shortHostname is a hostname compared without case, a trailing dot or a
+// ".local" suffix, which is how one machine's own name and its local
+// network name match: "hung-mini", "Hung-Mini.local" and
+// "hung-mini.local." are one name.
+func shortHostname(name string) string {
+	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
+	return strings.TrimSuffix(name, ".local")
+}
+
+// targetHost is the host part of an sshTarget.
+func targetHost(target string) string {
+	_, rest, _ := strings.Cut(target, "@")
+	if i := strings.LastIndexByte(rest, ':'); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
 }
 
 // probeSuggestions asks each machine for its sessions, a few at a time,
