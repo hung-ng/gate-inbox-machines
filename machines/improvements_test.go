@@ -138,7 +138,7 @@ func TestSpawnArgvAndForm(t *testing.T) {
 		t.Fatal("unknown tools must allow typing")
 	}
 	keys := e.machineUI().Keys
-	if keys[0].Action != "new_on_machine" || keys[0].Keys[0] != "N" || keys[1].Screen != spawnScreen {
+	if keys[0].Action != "new_on_machine" || keys[0].Keys[0] != "N" || keys[1].Keys[0] != "O" || keys[2].Screen != spawnScreen {
 		t.Fatal(keys)
 	}
 }
@@ -221,17 +221,33 @@ func TestFormOpensSpawnsNotifiesAndWakesPoll(t *testing.T) {
 	}
 }
 
-func TestPlanStoppedBoardOnlyPinsExistingRunningMirrors(t *testing.T) {
+// A stopped board's tmux still says what can be attached to, so a session
+// there gets a row with no status, and nothing is archived on the word of
+// its saved sessions alone.
+func TestPlanStoppedBoardMirrorsLiveSessionsWithoutStatus(t *testing.T) {
 	prev := withMirrors("mini/a1", "l1")
 	obs := seen(mini, live("b2", "waiting"))
 	obs.Snapshot.BoardRunning = boolPtr(false)
 	actions, next := plan(prev, []host{mini}, []observation{obs}, rows(mirrorRow("l1", true)), nil, nil)
-	if len(actions) != 1 || actions[0].Kind != actPin || actions[0].Status != "errored" || !sameState(prev, next) {
-		t.Fatal(actions, next)
+	if got := describe(actions); strings.Join(got, ",") != "launch mini/b2 as errored,pin l1 errored" {
+		t.Fatal(got)
+	}
+	if next.Mirrors["mini/a1"] != "l1" {
+		t.Fatal("a stopped board must not end a mirror", next)
 	}
 	actions, _ = plan(prev, []host{mini}, []observation{obs}, rows(mirrorRow("l1", false)), nil, nil)
-	if len(actions) != 0 {
-		t.Fatal("must not reconnect a dead mirror while board is stopped", actions)
+	if got := describe(actions); strings.Join(got, ",") != "launch mini/b2 as errored" {
+		t.Fatal("must not reconnect a mirror whose session it can't see", got)
+	}
+	obs = seen(mini, live("a1", "waiting"))
+	obs.Snapshot.BoardRunning = boolPtr(false)
+	actions, _ = plan(prev, []host{mini}, []observation{obs}, rows(mirrorRow("l1", false)), nil, nil)
+	if got := describe(actions); strings.Join(got, ",") != "relaunch l1 for mini/a1 as errored" {
+		t.Fatal(got)
+	}
+	actions, _ = plan(prev, []host{mini}, []observation{obs}, rows(mirrorRow("l1", true)), map[string]string{"l1": "waiting"}, map[string]bool{"l1": true})
+	if got := describe(actions); strings.Join(got, ",") != "pin l1 errored" {
+		t.Fatal(got)
 	}
 }
 
@@ -273,9 +289,9 @@ func TestCachedToolsSurviveFailureAndAreCopied(t *testing.T) {
 	replies := hosts{"mini": snapshot{Version: wireVersion, Tools: []string{"agent"}}}
 	m := newMirrors(e.cfg, newFakeBoard(), nil, quiet(), replies.run, t.TempDir())
 	m.tools = &e.tools
-	m.observe(context.Background())
+	m.observe(context.Background(), m.reg.active())
 	replies["mini"] = context.DeadlineExceeded
-	m.observe(context.Background())
+	m.observe(context.Background(), m.reg.active())
 	copy := e.tools.copy()
 	if strings.Join(copy["mini"], ",") != "agent" {
 		t.Fatal(copy)

@@ -31,7 +31,7 @@ func TestConfigureFillsDefaults(t *testing.T) {
 	if !ok {
 		t.Fatal("host mini missing")
 	}
-	want := host{Name: "mini", Destination: "mini", GateInbox: "gate-inbox", Tmux: "tmux"}
+	want := host{Name: "mini", Destination: "mini", GateInbox: "gate-inbox", Tmux: "tmux", Source: sourceConfig}
 	if h != want {
 		t.Errorf("host = %+v, want %+v", h, want)
 	}
@@ -89,9 +89,14 @@ func TestConfigureReadsEveryHostKey(t *testing.T) {
 		t.Errorf("cfg = %+v", e.cfg)
 	}
 	h, _ := e.cfg.host("box")
+	settings := hostSettings{
+		Destination: "me@box.example.ts.net", GateInbox: "~/go/bin/gate-inbox",
+		Home: "~/.gi", Tmux: "/opt/homebrew/bin/tmux", TmuxSocket: "agents", Group: "linux box",
+	}
 	want := host{
 		Name: "box", Destination: "me@box.example.ts.net", GateInbox: "~/go/bin/gate-inbox",
 		Home: "~/.gi", Tmux: "/opt/homebrew/bin/tmux", TmuxSocket: "agents", Group: "linux box",
+		Source: sourceConfig, Settings: settings,
 	}
 	if h != want {
 		t.Errorf("host = %+v, want %+v", h, want)

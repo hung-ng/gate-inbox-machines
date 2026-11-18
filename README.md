@@ -20,6 +20,9 @@ questions. This extension adds two things to the same build:
   `ssh -t <machine> tmux attach -t =gi_<id>`, and pins the row's status to the one that machine's
   board reports. When the session ends on its machine, the mirror is archived.
 
+Every reply also says where that machine keeps `gate-inbox` and tmux, which tmux server its board
+uses, and which build it runs. Your board uses those, so a machine needs only an SSH destination.
+
 When you select a mirror, the board asks that machine for its recent conversation and current
 dialog over SSH. The preview uses the same message boxes and dialog cards as local sessions.
 Enter opens the remote terminal so you can answer there, including when triage hands you the row.
@@ -39,67 +42,195 @@ Your config, state and sessions carry over. The build script applies the preview
 temporary copy of the pinned Go module.
 
 Each other machine needs this build to answer `machines sessions` and `machines preview`. Its
-board can keep running stock Gate Inbox. Point `gate_inbox` at the extended binary on that machine.
+board can keep running stock Gate Inbox. If that machine's PATH finds the stock binary first, set
+`gate_inbox` for it to this build's path.
 
 Each machine needs an SSH key login from the one you sit at that works without a prompt, because
-the extension runs SSH with `BatchMode=yes`. Check it with `ssh <machine> true`.
+the extension runs SSH with `BatchMode=yes`. `machines add` sets that up for you when it can (see
+below).
 
-## Configure
+## Add a machine
 
-On the machine you sit at, in `config.toml`, one table per machine. The table's name is what its
-rows' badges say:
-
-```toml
-[extensions.machines.mini]
-destination = "hung-mini"                      # an ssh destination; defaults to the table's name
-
-[extensions.machines.box]
-destination = "me@box.example.ts.net"
-```
-
-Most setups need only `destination`. The PATH a non-interactive SSH command gets usually leaves
-out Homebrew, so commands sent to a machine look for `gate-inbox` and tmux on its PATH and then in
-`~/go/bin`, `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`. Those come after the
-machine's own PATH, so they never override it. Set `gate_inbox` or `tmux` to a full path when
-they live somewhere else.
-
-Then check the setup from a plain shell:
+Start each other machine's board, then add the machine from the one you sit at, by its SSH
+destination: a host from `~/.ssh/config`, a hostname, or `user@host`.
 
 ```bash
-gate-inbox machines check        # every configured machine
-gate-inbox machines check mini   # just one
+gate-inbox machines add mini.example.com
+gate-inbox machines add --name box me@10.0.0.7
 ```
 
-It tries each step the board needs, in order: SSH without a prompt, `gate-inbox` and this build's
-`machines` command there, tmux, the sessions reply, that machine's board running, and a session a
-mirror can attach to. A failed step ends with what to change, and the command exits non-zero:
+Or press `O` on the board to open the machines screen, then `a`.
+
+Adding runs each step the board needs, in order: SSH without a prompt, `gate-inbox` and this
+build's `machines` command there, tmux, the sessions reply, that machine's board running, and a
+session a mirror can attach to. The machine is added once the steps up to the sessions reply pass.
+A stopped board or no sessions yet doesn't stop it. A running board shows its sessions within a few
+seconds, with no restart.
+
+When SSH can't log in without a prompt, `machines add` at a terminal offers the fix and checks
+again:
+
+- no key on that machine: it runs `ssh-copy-id <destination>`, and you type that machine's
+  password once
+- an unknown host key: it connects once without `BatchMode`, so you can check the fingerprint and
+  accept it
+
+On the machines screen, the same problems offer `ctrl+f`, which opens a setup row on the board
+running `machines add` in a pane. Its status is waiting, so triage hands it to you. Open it, type
+what it asks, and press Enter when it's done. The row is archived once its pane ends.
+
+The name defaults to the first part of the hostname the machine reports, such as `box-1` for
+`Box-1.local`. `--name` sets your own. Names are lower case letters, digits, `-` and `_`, and start
+with a letter. Each row's name starts with it, such as `box-1-upgrade-http-client`, so a short one
+reads better.
+
+Adding a machine changes nothing on that machine. SSH must already be on there: on a Mac, Remote
+Login under System Settings → General → Sharing, and on Linux, the `sshd` service.
+
+### What each machine reports
+
+Every sessions reply carries what that machine says about itself:
+
+- the full path of its own `gate-inbox`
+- the tmux it found on its PATH, the one described under [Settings](#settings)
+- the tmux server its board keeps sessions on: `tmux_socket` in its `config.toml`, then
+  `GATE_INBOX_TMUX_SOCKET`, then tmux's default server
+- its hostname, OS and this extension's version
+
+The board saves it in `learned.json` in the extension's data folder, and polls, mirrors, previews and
+spawns use it from then on. When a reply names a different tmux server than the one the board
+asked about, the board asks again about that one before it starts or puts away any mirror. The
+paths must be absolute and the socket a plain name, or the board ignores them.
+
+A machine whose PATH has no `gate-inbox` is asked once more through your login shell there, which
+is where most installers put it. Its reply gives the full path, and later polls use it directly.
+
+`machines check` warns when the two machines run different versions of this extension.
+
+### Manage machines
+
+The machines screen (`O`) lists every machine with its state: online with its session count, board
+stopped, offline since a time and why, or paused. Under it are suggestions to add (see below). Keys:
+
+| Key | What it does |
+|---|---|
+| `a` | Add a machine. On a suggestion, the form starts with its destination |
+| `enter` | Check the machine under the cursor, or add the suggestion |
+| `c` | Check the machine and show each step |
+| `space` | Pause or resume. A paused machine isn't polled, and its mirrors are put away until it resumes |
+| `d` | Remove, after a second `d`. Its mirrors are put away. Its agents keep running |
+| `s` | Start its board (see below) |
+| `n` | Start a session there, as `N` on the list does |
+| `r` | Rename. Its mirrors come back under the new name |
+| `esc`, `q` | Close |
+
+From a shell:
+
+```bash
+gate-inbox machines list                # every machine, where it's written, and what it reported
+gate-inbox machines check               # walk every machine through the steps above
+gate-inbox machines check mini          # just one
+gate-inbox machines pause mini
+gate-inbox machines resume mini
+gate-inbox machines rename box-1 box
+gate-inbox machines remove box
+gate-inbox machines start-board mini
+```
+
+A failed check step ends with what to change, and `check` exits non-zero:
 
 ```text
 mini: ssh OK
 mini: gate-inbox FAIL (exit status 127: env: gate-inbox: No such file or directory); set gate_inbox to its full path
 ```
 
-Other keys. The first three go directly under `[extensions.machines]`, so a machine can't be
-named `poll`, `ssh` or `control_path`:
+### Start a machine's board
+
+The board on each machine has to run for its sessions to have a status. `s` on the machines screen,
+or `machines start-board <machine>`, starts it in a detached tmux session named
+`gate-inbox-board` on that machine's default tmux server, through your login shell there. Nothing
+happens if its board is already running. See it with
+`ssh -t <destination> tmux attach -t gate-inbox-board`.
+
+A board started over SSH starts its agents the same way. On a Mac, that means Claude Code can't
+read the login keychain (see [the Mac sign-in limit](#start-a-session-on-another-machine)).
+Starting the board from that Mac's own desktop session avoids it.
+
+### Suggestions
+
+The machines screen suggests machines to add from two places, and leaves out any already on the
+board:
+
+- **Hosts in `~/.ssh/config`**, and the files it includes. Patterns such as `*.example.com` are
+  left out. The board doesn't connect to these until you pick one, since that file often names
+  servers that have nothing to do with this board.
+- **The `discover` command**, if you set one. It runs on the machine you sit at and prints one
+  destination per line. Blank lines, lines starting with `#`, and anything after the first word
+  are skipped. The board checks each one when the screen opens and shows what it found, such as
+  `ready, board running` or `needs your SSH key`.
+
+The extension knows nothing about any network, so `discover` is how a VPN's peer list, an
+inventory or a plain file becomes suggestions:
+
+```toml
+[extensions.machines]
+# a file you keep yourself
+discover = ["cat", "/Users/me/.config/gate-inbox/machines.txt"]
+
+# Tailscale peers that are online
+# discover = ["sh", "-c", "tailscale status --json | jq -r '.Peer[] | select(.Online) | .DNSName'"]
+```
+
+### Where machines are kept
+
+Machines added with `machines add` or the machines screen live in `machines.json`, and pauses
+for any machine live there too. It's in the extension's data folder,
+`<config dir>/extensions/machines/`, next to `learned.json` and the mirrors' state. The board
+never rewrites your `config.toml`, the same way Gate Inbox keeps its own Settings out of it.
+
+You can still write machines in `config.toml`, one table per machine. The table's name is the
+machine's name:
+
+```toml
+[extensions.machines.mini]
+destination = "mini.example.com"   # an ssh destination; defaults to the table's name
+```
+
+A machine in `config.toml` wins over an added one with the same name, and the board reads it only
+at startup. The machines screen and `machines list` say where each machine is written. To remove
+or rename one from `config.toml`, edit its table. Pausing works on both.
+
+### Settings
+
+Most machines need only a destination. The PATH a non-interactive SSH command gets usually leaves
+out Homebrew. So until a machine has reported its own paths, commands sent to it look for
+`gate-inbox` and tmux on its PATH and then in `~/go/bin`, `~/.local/bin`, `/opt/homebrew/bin` and
+`/usr/local/bin`. Those come after the machine's own PATH, so they never override it.
+
+The first four keys go directly under `[extensions.machines]`, so no machine can be named `poll`,
+`ssh`, `control_path` or `discover`. The per-machine keys go in a `config.toml` table, or with
+`machines add` for `group` and `home`. A key you set wins over what the machine reports.
 
 | Key | Default | What it does |
 |---|---|---|
 | `poll` | `"3s"` | How often each machine is asked for its sessions |
-| `ssh` | `["ssh"]` | The ssh command and any options of your own, such as `["ssh", "-F", "/Users/me/.ssh/agents"]` |
+| `ssh` | `["ssh"]` | The ssh command and any options of your own, such as `["ssh", "-F", "/Users/me/.ssh/agents"]`. `ssh-copy-id` doesn't get these options |
 | `control_path` | `/tmp/gate-inbox-machines-<uid>/%C` | Where ssh keeps the connection it shares between a machine's polls and its mirrors. `"none"` turns sharing off |
+| `discover` | none | A command whose output becomes suggestions (see above) |
 | `<name>.destination` | the table's name | The ssh destination: a name from `~/.ssh/config`, or `user@host` |
-| `<name>.gate_inbox` | `gate-inbox` | This build on that machine |
-| `<name>.tmux` | `tmux` | tmux on that machine |
+| `<name>.gate_inbox` | what the machine reports | This build on that machine |
+| `<name>.tmux` | what the machine reports | tmux on that machine |
 | `<name>.home` | none | `GATE_INBOX_HOME` of the board on that machine, if it uses one |
-| `<name>.tmux_socket` | none | That board's `tmux_socket`, if it sets one |
+| `<name>.tmux_socket` | what the machine reports | That board's `tmux_socket` |
 | `<name>.group` | top level | An existing group to file the machine's rows under. An extension cannot create a group, so make it first with `ctrl+alt+g` |
 
-The build also supplies a `[tools.mirror]` block, which is the tool mirrors launch with. It shows
-in the new-session picker. Starting it from there only prints a note saying to pick an agent CLI,
-and `machines sessions` never reports such a session. Uncheck it under Settings → CLIs to hide it.
+The build also supplies a `[tools.mirror]` block, which is the tool mirrors and setup rows launch
+with. It shows in the new-session picker. Starting it from there only prints a note saying to pick
+an agent CLI, and `machines sessions` never reports such a session. Uncheck it under Settings →
+CLIs to hide it.
 
 A machine's polls and mirrors share one SSH connection. It closes 10 minutes after the last of
-them stops.
+them stops. The checks behind suggestions use a connection of their own that closes when they end.
 
 ## What you see
 
@@ -112,13 +243,17 @@ them stops.
   stand-in status that keeps the connection problem visible in every layout, not a claim that
   the agent failed. The extension owns those rows so they stay out of triage, the attention
   filter and Tab jumps. Nothing is archived or relaunched until the machine answers again.
-- A reachable machine whose board stopped gets the same treatment, with
-  `✕ mini board stopped` and a detail line asking you to start its board. Agent processes can
-  keep running after their board quits, but their saved statuses cannot be trusted. That
-  machine's `machines sessions` tells by checking that the process whose PID is in its board's
-  `manager.lock` is alive. It never takes that lock, which could make a board starting at the same
-  moment take over from a live one. A reply from an older build without this check reads as
-  running. When the board is back, the rows get their real status again.
+- A reachable machine whose board stopped shows its sessions anyway, so an agent started with `N`
+  while that board is down can still be opened from here. Its rows are pinned to `errored` with a
+  `✕ mini board stopped` badge and a detail line saying there's no status until you start that
+  machine's board. They stay out of triage like an offline machine's rows. Agent processes can
+  keep running after their board quits, but their saved statuses cannot be trusted. So a row
+  appears for each session that machine's tmux says a mirror can attach to right now, and no row
+  is put away until the board is back. That machine's `machines sessions` tells whether its board
+  runs by checking that the process whose PID is in its board's `manager.lock` is alive. It never
+  takes that lock, which could make a board starting at the same moment take over from a live one.
+  A reply from an older build without this check reads as running. When the board is back, the
+  rows get their real status again.
 - If a mirror can't attach, its pane says why (the connection dropped, no tmux on the PATH, tmux
   refused the target) and tries again with backoff (1s, 2s, 4s, up to 30s). The row stays, and the
   board's log names the reason once. A mirror's pane never exits on its own: a pane whose command
@@ -140,6 +275,7 @@ them stops.
   and `ctrl+\` always goes back to the list. The status line at the bottom of the pane is drawn
   by the other machine's board, so its key hints are for that board.
 - `N` on the list starts an agent on another machine. See the next section.
+- `O` on the list opens the machines screen.
 - If scrolling leaves a mirror in tmux scroll mode, press `q` inside it to type again. On the
   list, `q` quits your board.
 - `x` on the list, or `ctrl+x` inside a mirror once you confirm, closes the mirror and files its
@@ -150,7 +286,8 @@ them stops.
 
 ## Start a session on another machine
 
-Press `N` on the list to open the machine form immediately. With one configured machine,
+Press `N` on the list to open the machine form immediately. With no machines yet, `N` opens the
+machines screen instead. With one configured machine,
 Machine is preselected and CLI, Task and Directory appear together. With several machines,
 choose one and press Enter before filling the remaining fields. The v1.1.0 form API does not
 report picker changes, so changing machines also requires Enter to refresh the CLI choices.
@@ -218,7 +355,13 @@ sequences, which is left as future work.
   bash and zsh all read it back as written, and the tests check this against each shell.
 - **What comes back from a machine is checked.** Session ids must be the board's hex ids before they
   are used in a tmux target, and a reply in another wire version is refused, with a message saying
-  to run the same build on both machines.
+  to run the same build on both machines. The paths a machine reports must be absolute, with no
+  line breaks, and are quoted like every other word. Its tmux socket must be a plain name.
+- **Discovery connects only where you asked it to.** Hosts from `~/.ssh/config` are listed, not
+  contacted, until you pick one. The `discover` command is one you set yourself, and it runs on
+  the machine you sit at.
+- **Fixes that need a password run where you can see them.** `ssh-copy-id` and the host-key prompt
+  run at your terminal or in a setup row you open. The board's own SSH never prompts.
 
 ## Limits
 
@@ -249,8 +392,12 @@ sequences, which is left as future work.
 ```
 
 The tests cover config, quoting (each quoted word is checked against real `sh`, `bash` and
-`zsh`), the PATH a command gets on the other machine, `machines check`, the wire format, the
-reconcile plan, the reconnect loop, the launch guard, and full passes against a fake board.
+`zsh`, including `start-board`'s command), the PATH a command gets on the other machine,
+`machines check`, the wire format and what a machine reports about itself, adding, pausing,
+renaming and removing machines, two processes sharing the machine files, suggestions from
+`~/.ssh/config` and a `discover` command, the machines screen and its add form, setup rows, the
+reconcile plan (a stopped board included), the reconnect loop, the launch guard, and full passes
+against a fake board.
 
 It was also checked end to end with two boards on one machine. Board A ran the scripted agent from
 Gate Inbox's `tools/demo/fake-agent.sh`, and board B mirrored A through a stand-in `ssh` that runs
@@ -291,6 +438,21 @@ the mini:
 - restarting either board brought the mirrors back
 - a Claude started by hand, which the mini's board adopted from another tmux server, was listed as
   `not mirrored`
+
+Machine management was then checked end to end on v1.1.0 with two boards on one Mac, each with
+its own home and tmux servers, joined by the same kind of stand-in `ssh`. The far board kept its
+sessions on a named tmux socket and its `gate-inbox` where only its `.zprofile` put it on PATH, and
+the near board's config named neither. That run covered:
+
+- `machines add` finding `gate-inbox` through the login shell and learning the far tmux path and
+  socket, then mirrors attaching with no `tmux` or `tmux_socket` setting
+- refusing a destination that can't be reached
+- an agent started while the far board was stopped showing as a row with no status, then getting
+  its real status once `s` on the machines screen started that board
+- the add form stopping at a missing key, `ctrl+f` opening a setup row that triage offered, and the
+  row being archived once its pane finished
+- rename, pause and resume on the machines screen, and remove and add from a shell, each taking
+  effect on the running board within a pass
 
 Shift+enter through two tmux layers is still untested in a real terminal.
 

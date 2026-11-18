@@ -31,6 +31,11 @@ type settings struct {
 	// machine's polls and its mirrors' panes. "none" opens a connection
 	// each time instead.
 	ControlPath string `toml:"control_path"`
+	// Discover is a command, run on this machine, that prints the
+	// destinations of machines to suggest when one is added: one a line.
+	// It is how a network's own peer list (a VPN, an inventory) becomes
+	// suggestions without this extension knowing that network.
+	Discover []string `toml:"discover"`
 	// Hosts are the machines whose boards this one shows, keyed by the name
 	// the board puts on their rows: every table in the section.
 	Hosts map[string]hostSettings `toml:"-"`
@@ -38,7 +43,7 @@ type settings struct {
 
 // settingKeys are the section's own keys. Every other key is a machine's
 // table, so these are the only names a machine cannot have.
-var settingKeys = []string{"poll", "ssh", "control_path"}
+var settingKeys = []string{"poll", "ssh", "control_path", "discover"}
 
 // decodeSettings splits the section into its own keys and its machines'
 // tables, and decodes each through extension.Config, so a misspelt key is
@@ -83,30 +88,34 @@ func (r *rawValue) UnmarshalTOML(data any) error {
 	return nil
 }
 
-// hostSettings is one [extensions.machines.<name>] table.
+// hostSettings is one [extensions.machines.<name>] table, or one machine
+// added with `machines add`, which keeps the same keys in machines.json.
 type hostSettings struct {
 	// Destination is what ssh connects to: a name from ~/.ssh/config, or
 	// user@host. Empty uses the table's own name.
-	Destination string `toml:"destination"`
-	// GateInbox is this build's binary on that machine. A non-interactive ssh
-	// command gets a short PATH, so a binary under ~/go/bin is named in full
-	// ("~/go/bin/gate-inbox" works).
-	GateInbox string `toml:"gate_inbox"`
+	Destination string `toml:"destination" json:"destination"`
+	// GateInbox is this build's binary on that machine. The machine says
+	// where its binary is in every sessions reply, so this is only needed
+	// when the first poll can't find it on any PATH it tries.
+	GateInbox string `toml:"gate_inbox" json:"gate_inbox,omitempty"`
 	// Home is GATE_INBOX_HOME for the board on that machine, when it runs
 	// on a home of its own.
-	Home string `toml:"home"`
+	Home string `toml:"home" json:"home,omitempty"`
 	// Tmux is tmux on that machine, by the same rule as GateInbox.
-	Tmux string `toml:"tmux"`
-	// TmuxSocket is that board's own tmux_socket setting, when it has one.
-	TmuxSocket string `toml:"tmux_socket"`
+	Tmux string `toml:"tmux" json:"tmux,omitempty"`
+	// TmuxSocket is that board's own tmux_socket setting. The machine
+	// reports it, so this overrides what it says.
+	TmuxSocket string `toml:"tmux_socket" json:"tmux_socket,omitempty"`
 	// Group is the group this board files the machine's sessions under,
 	// one that already exists on this board: an extension cannot create a
 	// group. Empty files them at the top level, where each row's badge
 	// names its machine.
-	Group string `toml:"group"`
+	Group string `toml:"group" json:"group,omitempty"`
 }
 
-// host is one hostSettings with its defaults filled in and checked.
+// host is one machine with its defaults filled in and checked, and with
+// what the machine last said about itself (see about) where the operator
+// set nothing.
 type host struct {
 	Name        string
 	Destination string
@@ -115,6 +124,17 @@ type host struct {
 	Tmux        string
 	TmuxSocket  string
 	Group       string
+	// Source is where the machine was written: config.toml, or added
+	// with `machines add` or the machines screen.
+	Source string
+	// Paused is a machine the operator paused: it is not polled, and its
+	// mirrors are put away until it is resumed.
+	Paused bool
+	// Settings is what the operator wrote. A key set there wins over what
+	// the machine reports about itself.
+	Settings hostSettings
+	// About is what the machine last reported about itself, once it has.
+	About *about
 }
 
 // config is the whole section, resolved.
@@ -122,6 +142,7 @@ type config struct {
 	Poll        time.Duration
 	SSH         []string
 	ControlPath string
+	Discover    []string
 	Hosts       []host
 }
 
@@ -142,6 +163,7 @@ func resolve(s settings) (config, error) {
 		Poll:        s.Poll.Duration,
 		SSH:         s.SSH,
 		ControlPath: s.ControlPath,
+		Discover:    s.Discover,
 	}
 	if cfg.Poll == 0 {
 		cfg.Poll = defaultPoll
@@ -158,6 +180,9 @@ func resolve(s settings) (config, error) {
 	if cfg.ControlPath == "" {
 		cfg.ControlPath = defaultControlPath()
 	}
+	if len(cfg.Discover) > 0 && cfg.Discover[0] == "" {
+		return config{}, errors.New("discover names an empty command")
+	}
 	names := make([]string, 0, len(s.Hosts))
 	for name := range s.Hosts {
 		names = append(names, name)
@@ -168,14 +193,15 @@ func resolve(s settings) (config, error) {
 		if err != nil {
 			return config{}, fmt.Errorf("%s: %w", name, err)
 		}
+		h.Source = sourceConfig
 		cfg.Hosts = append(cfg.Hosts, h)
 	}
 	return cfg, nil
 }
 
 func resolveHost(name string, s hostSettings) (host, error) {
-	if !hostNamePattern.MatchString(name) {
-		return host{}, errors.New("a machine's name is lower case, starts with a letter, and holds only letters, digits, '-' and '_'")
+	if err := checkName(name); err != nil {
+		return host{}, err
 	}
 	h := host{
 		Name:        name,
@@ -185,6 +211,7 @@ func resolveHost(name string, s hostSettings) (host, error) {
 		Tmux:        s.Tmux,
 		TmuxSocket:  s.TmuxSocket,
 		Group:       s.Group,
+		Settings:    s,
 	}
 	if h.Destination == "" {
 		h.Destination = name
@@ -211,6 +238,17 @@ func resolveHost(name string, s hostSettings) (host, error) {
 		}
 	}
 	return h, nil
+}
+
+// checkName refuses a name a machine can't have.
+func checkName(name string) error {
+	if !hostNamePattern.MatchString(name) {
+		return errors.New("a machine's name is lower case, starts with a letter, and holds only letters, digits, '-' and '_'")
+	}
+	if slices.Contains(settingKeys, name) {
+		return fmt.Errorf("%q is one of the section's own keys, so no machine can have it as a name", name)
+	}
+	return nil
 }
 
 func (c config) host(name string) (host, bool) {

@@ -1,6 +1,7 @@
 package machines
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,9 @@ const wireVersion = 1
 // snapshot is what `machines sessions --json` prints: the agent sessions a
 // host's board is running, as that board reads them.
 type snapshot struct {
+	// About is what the machine says about itself. A build from before
+	// it leaves it out, and the board then goes on its own settings.
+	About        *about           `json:"about,omitempty"`
 	BoardRunning *bool            `json:"board_running,omitempty"`
 	Tools        []string         `json:"tools,omitempty"`
 	Version      int              `json:"version"`
@@ -105,6 +109,35 @@ func parseSnapshot(r io.Reader) (snapshot, error) {
 	if err := decoder.Decode(&snap); err != nil {
 		return snapshot{}, fmt.Errorf("the machine's reply is not a session list: %w", err)
 	}
+	return checkSnapshot(snap)
+}
+
+// parseSnapshotAfterGreeting reads a reply that came through a login
+// shell, whose login files may print a greeting first: the list is the
+// first line that starts one.
+func parseSnapshotAfterGreeting(out []byte) (snapshot, error) {
+	var first error
+	for offset := 0; offset < len(out); {
+		snap, err := parseSnapshot(bytes.NewReader(out[offset:]))
+		if err == nil {
+			return snap, nil
+		}
+		if first == nil {
+			first = err
+		}
+		i := bytes.IndexByte(out[offset:], '\n')
+		if i < 0 {
+			break
+		}
+		offset += i + 1
+	}
+	if first == nil {
+		first = errors.New("the machine's reply is empty")
+	}
+	return snapshot{}, first
+}
+
+func checkSnapshot(snap snapshot) (snapshot, error) {
 	if snap.Version != wireVersion {
 		return snapshot{}, fmt.Errorf("the machine's build speaks version %d of the session list and this one speaks %d; run the same build on both", snap.Version, wireVersion)
 	}
@@ -117,6 +150,10 @@ func parseSnapshot(r io.Reader) (snapshot, error) {
 			return snapshot{}, fmt.Errorf("the machine listed session %s twice", s.ID)
 		}
 		seen[s.ID] = true
+	}
+	if snap.About != nil {
+		a := snap.About.clean()
+		snap.About = &a
 	}
 	return snap, nil
 }

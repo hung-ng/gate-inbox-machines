@@ -50,12 +50,24 @@ func ensureControlDir(path string) error {
 // It names the tmux and socket the host's mirrors attach through, so the
 // host marks a session attachable exactly when an attach would find it.
 func listArgv(cfg config, h host) []string {
+	return sshArgv(cfg, false, h.Destination, listCommand(h))
+}
+
+func listCommand(h host) string {
 	args := []string{"machines", "sessions", "--json", "--tmux", h.Tmux}
 	if h.TmuxSocket != "" {
 		args = append(args, "--tmux-socket", h.TmuxSocket)
 	}
-	command := machineCommand(h, h.GateInbox, args...)
-	return sshArgv(cfg, false, h.Destination, command)
+	return machineCommand(h, h.GateInbox, args...)
+}
+
+// loginShell runs command through the operator's login shell on the
+// machine, for what needs the PATH and environment their login files set:
+// a spawn, whose agent inherits that environment, or a first poll of a
+// machine whose gate-inbox only the login shell finds. Polls skip it to
+// stay fast.
+func loginShell(cfg config, destination, command string) []string {
+	return sshArgv(cfg, false, destination, `exec "$SHELL" -l -c `+shellWord(command))
 }
 
 // attachArgv is the ssh command line a mirror's pane runs: the session's

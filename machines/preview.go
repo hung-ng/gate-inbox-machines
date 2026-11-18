@@ -20,11 +20,22 @@ type previewRoute struct {
 type previewRoutes struct {
 	mu   sync.RWMutex
 	rows map[string]previewRoute
+	// stopped is the mirrors whose machine's board is stopped, by machine,
+	// so their preview can say why it is empty.
+	stopped map[string]string
 }
 
 func (r *previewRoutes) update(state state, observed []observation) {
 	rows := make(map[string]previewRoute, len(state.Mirrors))
+	stopped := map[string]string{}
 	for _, obs := range observed {
+		if obs.Err == nil && !obs.Snapshot.boardRunning() {
+			for _, session := range obs.Snapshot.Sessions {
+				if id := state.Mirrors[mirrorKey(obs.Host.Name, session.ID)]; id != "" {
+					stopped[id] = obs.Host.Name
+				}
+			}
+		}
 		if obs.Err != nil || !obs.Snapshot.boardRunning() {
 			continue
 		}
@@ -35,8 +46,18 @@ func (r *previewRoutes) update(state state, observed []observation) {
 		}
 	}
 	r.mu.Lock()
-	r.rows = rows
+	r.rows, r.stopped = rows, stopped
 	r.mu.Unlock()
+}
+
+// unavailable is why a mirror has no preview.
+func (r *previewRoutes) unavailable(id string) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if machine := r.stopped[id]; machine != "" {
+		return fmt.Errorf("no preview until %s's board is running", machine)
+	}
+	return fmt.Errorf("the remote session is unavailable")
 }
 
 func (r *previewRoutes) lookup(id string) (previewRoute, bool) {
@@ -50,7 +71,7 @@ func (e *Extension) readPreview(ctx context.Context, localID string) (extension.
 	var preview extension.SessionPreview
 	route, ok := e.previews.lookup(localID)
 	if !ok {
-		return preview, fmt.Errorf("the remote session is unavailable")
+		return preview, e.previews.unavailable(localID)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

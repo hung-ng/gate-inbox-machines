@@ -118,14 +118,14 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 		}
 	}
 
-	// A host taken out of the config takes its mirrors with it.
+	// A machine removed or paused takes its mirrors with it.
 	known := map[string]bool{}
 	for _, h := range configured {
 		known[h.Name] = true
 	}
 	for _, key := range sortedKeys(next.Mirrors) {
 		if hostName, _ := splitKey(key); !known[hostName] {
-			actions = append(actions, action{Kind: actArchive, Key: key, LocalID: next.Mirrors[key], Why: "its machine is no longer configured"})
+			actions = append(actions, action{Kind: actArchive, Key: key, LocalID: next.Mirrors[key], Why: "its machine was removed or paused"})
 			delete(next.Mirrors, key)
 		}
 	}
@@ -136,18 +136,19 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 	}
 
 	for _, obs := range observed {
-		if obs.Err != nil || !obs.Snapshot.boardRunning() {
+		if obs.Err != nil {
 			// Errored keeps a transport failure visible in every layout. It is a
 			// stand-in for unavailable status, not a claim about the agent.
-			for _, key := range sortedKeys(next.Mirrors) {
-				id := next.Mirrors[key]
-				name, _ := splitKey(key)
-				if name == obs.Host.Name && local[id].Running && pinned[id] != "errored" {
-					actions = append(actions, action{Kind: actPin, Key: key, LocalID: id, Status: "errored"})
-				}
-			}
+			actions = append(actions, pinRest(obs.Host.Name, next, local, pinned, nil)...)
 			continue
 		}
+		// A machine whose board stopped still answers, and its tmux says
+		// which sessions a mirror can attach to right now. Those get a row,
+		// so an agent started with N while that board is down can still be
+		// opened from here. Its status can't be trusted with no board
+		// reading its pane, so every row is pinned to errored as a
+		// stand-in, and decorate owns it, keeping it out of triage.
+		stopped := !obs.Snapshot.boardRunning()
 		live := map[string]machineSession{}
 		for _, s := range obs.Snapshot.Sessions {
 			if s.Running && s.Attachable {
@@ -156,6 +157,9 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 		}
 		for _, id := range sortedKeys(live) {
 			s := live[id]
+			if stopped {
+				s.Status = "errored"
+			}
 			key := mirrorKey(obs.Host.Name, id)
 			if localID, ok := next.Mirrors[key]; ok {
 				// A mirror's attach never ends on its own, so a pane that has
@@ -183,6 +187,12 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 			}
 			actions = append(actions, action{Kind: actLaunch, Key: key, Host: obs.Host, Session: s, Status: pinStatus(s.Status)})
 		}
+		if stopped {
+			// A stopped board's saved sessions are not enough to end a
+			// mirror on: the rest stay as they are until the board is back.
+			actions = append(actions, pinRest(obs.Host.Name, next, local, pinned, live)...)
+			continue
+		}
 		prefix := obs.Host.Name + "/"
 		for _, key := range sortedKeys(next.Mirrors) {
 			if !strings.HasPrefix(key, prefix) {
@@ -205,6 +215,23 @@ func plan(prev state, configured []host, observed []observation, local map[strin
 		}
 	}
 	return actions, next
+}
+
+// pinRest pins to errored each running mirror of hostName's that is not in
+// skip, for a machine whose status can't be read.
+func pinRest(hostName string, next state, local map[string]extension.SessionInfo, pinned map[string]string, skip map[string]machineSession) []action {
+	var actions []action
+	for _, key := range sortedKeys(next.Mirrors) {
+		id := next.Mirrors[key]
+		name, _ := splitKey(key)
+		if name != hostName || isLive(key, skip) {
+			continue
+		}
+		if local[id].Running && pinned[id] != "errored" {
+			actions = append(actions, action{Kind: actPin, Key: key, LocalID: id, Status: "errored"})
+		}
+	}
+	return actions
 }
 
 func isLive(key string, live map[string]machineSession) bool {

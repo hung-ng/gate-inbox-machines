@@ -2,10 +2,12 @@ module github.com/hung-ng/gate-inbox-machines
 
 go 1.27.4
 
-require github.com/usestring/gate-inbox v1.1.0
+require (
+	github.com/BurntSushi/toml v1.6.0
+	github.com/usestring/gate-inbox v1.1.0
+)
 
 require (
-	github.com/BurntSushi/toml v1.6.0 // indirect
 	charm.land/bubbles/v2 v2.2.0 // indirect
 	charm.land/bubbletea/v2 v2.0.9 // indirect
 	charm.land/lipgloss/v2 v2.0.6 // indirect

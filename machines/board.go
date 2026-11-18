@@ -80,6 +80,12 @@ type mirrors struct {
 	owned    map[string]bool
 	tools    *toolCache
 	previews *previewRoutes
+	// reg is where the machines come from, read again every pass so one
+	// added or paused from a shell shows up without a restart.
+	reg *registry
+	// status is where each pass leaves every machine's state, for the
+	// machines screen.
+	status *statusBoard
 }
 
 // stateFile is the mirrors' saved state, in the extension's data dir.
@@ -100,6 +106,7 @@ func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logge
 		stopped: map[string]bool{},
 		owned:   map[string]bool{},
 	}
+	m.reg = newRegistry(cfg.Hosts, dataDir)
 	m.state = m.load()
 	return m
 }
@@ -120,13 +127,25 @@ func (m *mirrors) loop(ctx context.Context) {
 
 // pass is one poll of every host and one reconcile.
 func (m *mirrors) pass(ctx context.Context) {
-	observed := m.observe(ctx)
-	local, err := m.localMirrors(ctx)
+	if m.reg.reload() {
+		m.log.Info("the machines changed on disk", "machines", len(m.reg.all()))
+	}
+	if issue := m.reg.issue(); issue != m.lastErr[""] {
+		if issue != "" {
+			m.log.Warn("some added machines can't be used", "err", issue)
+		}
+		m.lastErr[""] = issue
+	}
+	hosts := m.reg.active()
+	observed := m.observe(ctx, hosts)
+	m.publish(observed)
+	local, setups, err := m.localRows(ctx)
 	if err != nil {
 		m.log.Warn("could not list the board's mirrors", "err", err)
 		return
 	}
-	actions, next := plan(m.state, m.cfg.Hosts, observed, local, m.pinned, m.current)
+	m.closeSetups(ctx, setups)
+	actions, next := plan(m.state, hosts, observed, local, m.pinned, m.current)
 	for _, key := range sortedKeys(next.Dismissed) {
 		if _, before := m.state.Dismissed[key]; !before {
 			m.log.Info("a mirror was archived from the board; it stays away until its session stops running", "key", key)
@@ -220,10 +239,10 @@ func (m *mirrors) pin(ctx context.Context, id, status string) {
 
 // observe polls every host at once, each bounded by its own timeout, so one
 // slow host does not hold the others' rows back.
-func (m *mirrors) observe(ctx context.Context) []observation {
-	observed := make([]observation, len(m.cfg.Hosts))
+func (m *mirrors) observe(ctx context.Context, hosts []host) []observation {
+	observed := make([]observation, len(hosts))
 	var wg sync.WaitGroup
-	for i, h := range m.cfg.Hosts {
+	for i, h := range hosts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -257,11 +276,29 @@ func (m *mirrors) observeOne(ctx context.Context, h host) observation {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	obs := observation{Host: h}
-	out, err := m.run(ctx, listArgv(m.cfg, h))
-	if err == nil {
-		obs.Snapshot, err = parseSnapshot(bytes.NewReader(out))
+	obs.Snapshot, obs.Err = pollHost(ctx, m.run, m.cfg, h)
+	if obs.Err == nil && obs.Snapshot.About != nil {
+		changed, err := m.reg.learn(h.Name, h.Destination, *obs.Snapshot.About)
+		if err != nil {
+			m.log.Warn("could not save what a machine said about itself", "machine", h.Name, "err", err)
+		}
+		if changed {
+			learned, ok := m.reg.host(h.Name)
+			if ok {
+				m.log.Info("machine described itself", "machine", h.Name, "hostname", learned.About.Hostname,
+					"gate_inbox", learned.GateInbox, "tmux", learned.Tmux, "tmux_socket", learned.TmuxSocket, "version", learned.About.Version)
+				// The reply said which sessions can be attached to through
+				// the tmux it was asked about. If the machine's own board
+				// keeps them on another server, ask again about that one
+				// before any mirror is started or put away.
+				if learned.TmuxSocket != h.TmuxSocket || learned.Tmux != h.Tmux {
+					obs.Snapshot, obs.Err = pollHost(ctx, m.run, m.cfg, learned)
+				}
+				obs.Host = learned
+			}
+		}
 	}
-	obs.Err = err
+	err := obs.Err
 	m.observeMu.Lock()
 	defer m.observeMu.Unlock()
 	// Say when a host goes away and when it comes back, not once a pass.
@@ -296,25 +333,76 @@ func (m *mirrors) observeOne(ctx context.Context, h host) observation {
 	return obs
 }
 
-// localMirrors is every unarchived mirror row on this board.
-func (m *mirrors) localMirrors(ctx context.Context) (map[string]extension.SessionInfo, error) {
+// localRows is every unarchived mirror row on this board, and every
+// setup row.
+func (m *mirrors) localRows(ctx context.Context) (map[string]extension.SessionInfo, map[string]extension.SessionInfo, error) {
 	local := map[string]extension.SessionInfo{}
+	setups := map[string]extension.SessionInfo{}
 	after := ""
 	for {
 		page, err := m.board.List(ctx, extension.SessionFilter{After: after})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, s := range page.Sessions {
-			if s.Role == mirrorRole && !s.Archived {
+			switch {
+			case s.Archived:
+			case s.Role == mirrorRole:
 				local[s.ID] = s
+			case s.Role == setupRole:
+				setups[s.ID] = s
 			}
 		}
 		if !page.Truncated || page.Cursor == "" {
-			return local, nil
+			return local, setups, nil
 		}
 		after = page.Cursor
 	}
+}
+
+// closeSetups archives each setup row whose pane has finished: its
+// machine was added or not, and the row has nothing more to show. The pane
+// marks itself done, since a pane whose command ends is left on a shell
+// and still reads as running.
+func (m *mirrors) closeSetups(ctx context.Context, setups map[string]extension.SessionInfo) {
+	for _, id := range sortedKeys(setups) {
+		if setups[id].Running && !setupDone(m.reg.dir, id) {
+			continue
+		}
+		if err := m.board.Archive(ctx, id); err != nil {
+			m.log.Warn("could not archive a finished setup row", "session", id, "err", err)
+			continue
+		}
+		clearSetupDone(m.reg.dir, id)
+		m.log.Info("archived a finished setup row", "session", id)
+	}
+}
+
+// pollHost asks one machine for its sessions. When the machine can't find
+// gate-inbox, and the operator's settings don't name it, it is asked once
+// more through the operator's login shell there, by its bare name: that is
+// where an installer usually puts it on PATH, and it covers a binary that
+// moved since the machine last said where it was. The reply says where it
+// is now, and later polls run it by that path, straight from ssh.
+func pollHost(ctx context.Context, run runner, cfg config, h host) (snapshot, error) {
+	out, err := run(ctx, listArgv(cfg, h))
+	if err == nil {
+		return parseSnapshot(bytes.NewReader(out))
+	}
+	if !notFound(err) || h.Settings.GateInbox != "" {
+		return snapshot{}, err
+	}
+	bare := h
+	bare.GateInbox = "gate-inbox"
+	out, loginErr := run(ctx, loginShell(cfg, h.Destination, listCommand(bare)))
+	if loginErr != nil {
+		return snapshot{}, err
+	}
+	snap, parseErr := parseSnapshotAfterGreeting(out)
+	if parseErr != nil || snap.About == nil || snap.About.GateInbox == "" {
+		return snapshot{}, err
+	}
+	return snap, nil
 }
 
 // launchRequest is the mirror row for one session on another machine: a pane running
@@ -372,7 +460,7 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 			fact = hostName + " · unreachable since " + m.since[hostName].Format("15:04") + " · gi_" + sessionID
 		case stopped[hostName]:
 			badge = extension.Badge{Text: "✕ " + hostName + " board stopped", Short: "✕", Tone: extension.ToneBad}
-			fact = hostName + " · start that machine's board · gi_" + sessionID
+			fact = hostName + " · no status until you start that machine's board · gi_" + sessionID
 		case scrolling[key]:
 			badge = extension.Badge{Text: "↕ scroll mode", Short: "↕", Tone: extension.ToneWarn}
 			fact = hostName + " · " + tools[key] + " · " + status[key] + " · scroll mode: press q inside the mirror to type again · gi_" + sessionID

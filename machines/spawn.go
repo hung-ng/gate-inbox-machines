@@ -23,7 +23,7 @@ func spawnArgv(cfg config, h host, cli, task, directory string) []string {
 		args = append(args, "--directory", directory)
 	}
 	args = append(args, "--json")
-	return sshArgv(cfg, false, h.Destination, `exec "$SHELL" -l -c `+shellWord(machineCommand(h, h.GateInbox, args...)))
+	return loginShell(cfg, h.Destination, machineCommand(h, h.GateInbox, args...))
 }
 
 func availableTools(ctx context.Context, h extension.Host) ([]string, error) {
@@ -42,27 +42,44 @@ func availableTools(ctx context.Context, h extension.Host) ([]string, error) {
 }
 
 func (e *Extension) machineUI() extension.UI {
-	return extension.UI{Preview: &extension.PreviewSource{Role: roleName, Read: e.readPreview}, Keys: []extension.KeyBinding{
+	keys := []extension.KeyBinding{
 		{Screen: extension.ScreenList, Action: "new_on_machine", Label: "new session on another machine", Keys: []string{"N"},
 			Run: func(ctx context.Context, _ extension.Press) error {
-				if len(e.cfg.Hosts) == 0 {
-					return fmt.Errorf("no machines configured")
+				if len(e.machines().active()) == 0 {
+					// With nowhere to start a session, N is the way to add a
+					// machine.
+					e.openMachines(ctx)
+					return nil
 				}
-				names := make([]string, len(e.cfg.Hosts))
-				for i, h := range e.cfg.Hosts {
-					names[i] = h.Name
-				}
-				known := e.tools.copy()
-				f := &spawnForm{e: e, ctx: ctx, names: names, known: known}
-				if len(names) == 1 {
-					f.machine = names[0]
-					f.tools = known[names[0]]
-				}
-				e.ui.Open(spawnScreen, f)
+				e.openSpawn(ctx, "")
+				return nil
+			}},
+		{Screen: extension.ScreenList, Action: "machines", Label: "add and manage your other machines", Keys: []string{"O"},
+			Run: func(ctx context.Context, _ extension.Press) error {
+				e.openMachines(ctx)
 				return nil
 			}},
 		{Screen: spawnScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "close"},
-	}}
+	}
+	return extension.UI{Preview: &extension.PreviewSource{Role: roleName, Read: e.readPreview}, Keys: append(keys, machinesKeys()...)}
+}
+
+// openSpawn shows the new-session form, on machine when one is named.
+func (e *Extension) openSpawn(ctx context.Context, machine string) {
+	var names []string
+	for _, h := range e.machines().active() {
+		names = append(names, h.Name)
+	}
+	known := e.tools.copy()
+	f := &spawnForm{e: e, ctx: ctx, names: names, known: known}
+	if machine == "" && len(names) == 1 {
+		machine = names[0]
+	}
+	if machine != "" {
+		f.machine = machine
+		f.tools = known[machine]
+	}
+	e.ui.Open(spawnScreen, f)
 }
 
 type spawnForm struct {
@@ -96,7 +113,7 @@ func (f *spawnForm) Key(k extension.ViewKey) bool {
 		return false
 	}
 	name := k.Values["machine"]
-	h, ok := f.e.cfg.host(name)
+	h, ok := f.e.machines().host(name)
 	if !ok {
 		return false
 	}
