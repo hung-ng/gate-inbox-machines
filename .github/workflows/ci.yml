@@ -23,8 +23,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux zsh
       - if: runner.os == 'macOS'
         run: brew list tmux >/dev/null 2>&1 || brew install tmux
+      # Upstream main can require a newer Go than go.mod names, so let this
+      # check fetch that toolchain instead of failing before it builds.
       - if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: go get github.com/usestring/gate-inbox@main
+        run: |
+          echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
+          GOTOOLCHAIN=auto go get github.com/usestring/gate-inbox@main
       - run: test -z "$(gofmt -l .)"
       - run: go build ./cmd/gate-inbox
       - run: go vet ./...
