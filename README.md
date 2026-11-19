@@ -6,6 +6,10 @@ This is a prototype of multi-machine support. It builds on stock Gate Inbox v1.1
 
 ## Screenshots
 
+![Triage jumps to a waiting Claude session on another machine](docs/screenshots/triage.gif)
+
+Claude on `mini` reaches an edit-permission prompt and its mirror row turns `waiting`. Stock triage (`i`) jumps to it, the operator approves the edit in the remote terminal, and `ctrl+q` returns to the board.
+
 ![Gate Inbox list with local and remote sessions](docs/screenshots/board.png)
 
 One board with local sessions and mirrors from two workers, `mini` and `devbox`, filed in a group per machine. The selected Claude session on `mini` is waiting on a permission prompt. Its `remote` line shows the worker's CPU, RAM and directory.
