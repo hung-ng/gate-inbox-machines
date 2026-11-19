@@ -10,14 +10,8 @@ import (
 	"time"
 )
 
-// runCheck walks each configured machine, or the ones named, through what
-// the board needs from it, in the order each step depends on the last. Setup
-// was the hard part of every first run: a key ssh can't use without asking,
-// a binary or tmux off the PATH an ssh command gets, socket names that don't
-// match. Each failure says what to change.
-//
-// It builds its commands with the board's own argv builders, so a machine
-// that passes is one the board can poll and attach to.
+// runCheck checks the named machines, or all unpaused machines when no
+// names are given. It uses the same SSH command builders as polling.
 func (e *Extension) runCheck(ctx context.Context, names []string, out io.Writer) error {
 	reg := e.machines()
 	hosts := reg.active()
@@ -103,9 +97,6 @@ type checkStep struct {
 
 // probeResult is one machine walked through the board's needs.
 type probeResult struct {
-	// Host is the machine as the probe ended up reaching it, with what it
-	// said about itself.
-	Host     host
 	Steps    []checkStep
 	Snapshot *snapshot
 }
@@ -190,7 +181,7 @@ func describeAbout(a about) string {
 func (e *Extension) probe(ctx context.Context, h host) probeResult {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	result := probeResult{Host: h}
+	var result probeResult
 	step := func(s checkStep) bool {
 		result.Steps = append(result.Steps, s)
 		return s.Err == nil
@@ -212,7 +203,6 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 				// files set.
 				if path := e.findThroughLogin(ctx, h, "gate-inbox"); path != "" {
 					h.GateInbox = path
-					result.Host = h
 					err = nil
 					step(checkStep{Name: "gate-inbox", Note: "found through your login shell at " + path})
 				}
@@ -245,7 +235,6 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 			snap, err = e.listOnce(ctx, learned)
 		}
 		h = learned
-		result.Host = h
 	}
 	if !step(checkStep{Name: "sessions reply", Err: err, Fix: "install the same build on both machines and check its sessions reply"}) {
 		return result
@@ -261,15 +250,19 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 		return result
 	}
 	step(checkStep{Name: "board running"})
-	// A board whose sessions none of them can be attached to is most often
-	// one on a tmux server the reply did not report.
-	if len(snap.Sessions) > 0 {
-		for _, s := range snap.Sessions {
-			if s.Attachable {
-				step(checkStep{Name: "attachable session"})
-				return result
-			}
+	// The poller only mirrors sessions that are both running and attachable.
+	hasRunning := false
+	for _, s := range snap.Sessions {
+		if !s.Running {
+			continue
 		}
+		hasRunning = true
+		if s.Attachable {
+			step(checkStep{Name: "attachable session"})
+			return result
+		}
+	}
+	if hasRunning {
 		fix := "check tmux_socket in that board's config.toml"
 		if h.About != nil && h.About.TmuxSocket != nil {
 			// The machine said which server its board uses, and it was

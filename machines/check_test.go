@@ -36,7 +36,7 @@ func TestCheckFailures(t *testing.T) {
 		{4, "", "garbage", "sessions reply FAIL"},
 		{4, "", `{"version":2}`, "same build on both"},
 		{5, "", `{"version":1,"board_running":false,"sessions":[]}`, "on mini, start Gate Inbox"},
-		{6, "", `{"version":1,"sessions":[{"id":"a1"}]}`, "check tmux_socket"},
+		{6, "", `{"version":1,"sessions":[{"id":"a1","running":true},{"id":"b2","attachable":true}]}`, "check tmux_socket"},
 	} {
 		t.Run(tc.want+tc.msg, func(t *testing.T) {
 			e := newManaged(t, healthyFar(), mini)
@@ -72,7 +72,7 @@ func TestCheckHealthyAndNamed(t *testing.T) {
 		if strings.Contains(strings.Join(a, " "), "-- box") {
 			t.Fatal(a)
 		}
-		return []byte(`{"version":1,"board_running":true,"sessions":[{"id":"a1","attachable":true}]}`), nil
+		return []byte(`{"version":1,"board_running":true,"sessions":[{"id":"a1","running":true,"attachable":true}]}`), nil
 	}
 	var out bytes.Buffer
 	if err := e.runCheck(context.Background(), []string{"mini"}, &out); err != nil {
@@ -87,6 +87,16 @@ func TestCheckHealthyAndNamed(t *testing.T) {
 	e.reg = newRegistry("")
 	if err := e.runCheck(context.Background(), nil, &out); err == nil || !strings.Contains(err.Error(), "no machines configured") {
 		t.Fatal("no machines accepted:", err)
+	}
+}
+
+func TestCheckIgnoresStoppedSessions(t *testing.T) {
+	far := healthyFar()
+	far.snap.Sessions = []machineSession{{ID: "a1", Status: "dead"}}
+	e := newManaged(t, far, mini)
+	var out bytes.Buffer
+	if err := e.runCheck(context.Background(), nil, &out); err != nil {
+		t.Fatalf("check with no running sessions: %v\n%s", err, out.String())
 	}
 }
 

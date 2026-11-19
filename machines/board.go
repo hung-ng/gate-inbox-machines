@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,6 +174,8 @@ func (m *mirrors) loop(ctx context.Context) {
 
 // pass is one poll of every host and one reconcile.
 func (m *mirrors) pass(ctx context.Context) {
+	now := m.now()
+	maps.DeleteFunc(m.failed, func(_ string, until time.Time) bool { return !until.After(now) })
 	if m.reg.reload() {
 		m.log.Info("the machines changed on disk", "machines", len(m.reg.all()))
 	}

@@ -350,7 +350,7 @@ func TestPassBacksOffALaunchTheBoardRefuses(t *testing.T) {
 	cfg := config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "none"}
 	board := newFakeBoard()
 	board.launchErr = errors.New("no tool machines")
-	reply := hosts{"mini": snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{live("a1", "idle")}}}
+	reply := hosts{"mini": snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{live("a1", "idle"), live("b2", "idle")}}}
 	m := newMirrors(cfg, board, nil, quiet(), reply.run, machineStore(t, t.TempDir(), mini))
 	m.pass(context.Background())
 	board.launchErr = nil
@@ -358,10 +358,16 @@ func TestPassBacksOffALaunchTheBoardRefuses(t *testing.T) {
 	if len(board.launches) != 0 {
 		t.Errorf("relaunched inside the backoff: %+v", board.launches)
 	}
+	snap := reply["mini"].(snapshot)
+	snap.Sessions = snap.Sessions[:1]
+	reply["mini"] = snap
 	m.now = func() time.Time { return time.Now().Add(launchBackoff + time.Second) }
 	m.pass(context.Background())
 	if len(board.launches) != 1 {
 		t.Errorf("did not launch once the backoff passed: %+v", board.launches)
+	}
+	if len(m.failed) != 0 {
+		t.Errorf("kept expired launch failures: %v", m.failed)
 	}
 }
 
