@@ -34,7 +34,8 @@ in a terminal, then retry. Press `T` on the board to open a terminal.
 Only the SSH destination is required. You can give the machine a name or put its rows in an
 existing local group. Use `g` on the main list to make a group. Set **Board home** if the
 remote board uses a custom `GATE_INBOX_HOME`. Set **Binary path** if SSH finds a different
-`gate-inbox` first. Run `gate-inbox machines add --help` for CLI options.
+`gate-inbox` first. Press Alt+a in the add form to show these path overrides. Run
+`gate-inbox machines add --help` for CLI options.
 
 On the machines screen:
 
@@ -63,17 +64,22 @@ through the screen or CLI.
   terminal to respond.
 - Use `ctrl+q` to leave the focused mirror or advance triage. `ctrl+\` returns to the list.
   If scrolling put the remote pane in tmux scroll mode, press `q` inside the mirror to leave it.
-- Press `N` on the list to start a remote agent. Choose a machine and press Enter to load its
-  installed CLIs, then fill in the task and optional directory. With one machine, it is already
-  selected. The check and spawn use the remote login shell so both see the agent's environment.
+- Press `N` on the list to start a remote session. Choose a machine and press Enter to load
+  its installed CLIs. With one machine, it is already selected. An agent can take a model,
+  name, first task, group, and directory. **Terminal** takes a directory and opens a shell
+  on the worker's tmux server. It appears on the controller as a mirror. Type `exit`
+  in the shell to end it. The check and launch both use the worker's login shell.
 - Restarting your board leaves mirrors running. Use `v` to revive a dead mirror. Press `alt+x`
   on a mirror, or choose **dismiss the selected remote mirror** from Quick Actions, to close
   the local SSH pane and archive its row. The remote agent keeps running. The row stays dismissed
   until you restore it or the remote session ends. To restore it, open the archive from the `:`
   menu, press `u` on its row, and confirm.
 - Offline, stopped and paused machines keep their rows and last status. A badge and the
-  `machine` details show the state and remote working directory. Removing a machine archives
-  its mirrors.
+  `remote` details show the state and remote working directory. Removing a machine archives
+  its mirrors. After losing SSH, an open mirror retries with delays up to 10 seconds.
+- A selected mirror shows the worker's CPU and RAM under `remote`. The board marks the
+  last reading stale if it stops getting worker stats. The `computer` meters show the
+  machine running the board.
 - Sessions need a `gi_<id>` tmux session. A pane adopted in place does not have one. To relaunch
   it as a board session, use stock `a` on the remote board.
 
@@ -101,8 +107,8 @@ The remote board's `tmux_socket` config takes precedence over `GATE_INBOX_TMUX_S
 and tmux's default socket. The extension learns the socket from the remote command, so an
 environment-only setting must also be available to that command on first discovery.
 
-The bundled `mirror` tool appears in the new-session picker. Hide it in Settings → CLIs.
-A mirror started by hand waits for a target.
+Uncheck `mirror` in Settings → CLIs to hide it in both local launch pickers.
+Use Shift+n to start a session on another machine. The board creates its mirror.
 
 ## Verify
 

@@ -30,6 +30,7 @@ type snapshot struct {
 	// it leaves it out, and the board then goes on its own settings.
 	About        *about           `json:"about,omitempty"`
 	BoardRunning *bool            `json:"board_running,omitempty"`
+	Stats        *workerStats     `json:"stats,omitempty"`
 	Tools        []string         `json:"tools,omitempty"`
 	Version      int              `json:"version"`
 	Sessions     []machineSession `json:"sessions"`
@@ -65,7 +66,7 @@ const (
 	mirrorRole = extensionID + "/" + roleName
 )
 
-// listSessions reads every agent session a board runs, for `machines sessions`.
+// listSessions reads agents and top-level terminals for `machines sessions`.
 // It leaves out this extension's own mirrors, and anything else on its
 // tool: two boards that mirror each other would otherwise mirror each
 // other's mirrors, a row deeper each poll.
@@ -74,14 +75,14 @@ const (
 // tmuxSessions read them.
 func listSessions(ctx context.Context, sessions extension.SessionService, attachable map[string]bool) (snapshot, error) {
 	snap := snapshot{Version: wireVersion, Sessions: []machineSession{}}
-	rows, err := allSessions(ctx, sessions.List)
+	rows, err := allSessions(ctx, sessions.List, extension.SessionFilter{IncludeTerminals: true})
 	if err != nil {
 		return snapshot{}, err
 	}
 	for _, s := range rows {
 		// The picker can launch the mirror tool without the mirror role.
 		// Those panes have no target and are left out too.
-		if s.Terminal || s.Archived || s.Role == mirrorRole || s.Tool == toolName || s.Tool == "machines" {
+		if (s.Terminal && s.ParentID != "") || s.Archived || s.Role == mirrorRole || s.Tool == toolName || s.Tool == "machines" {
 			continue
 		}
 		snap.Sessions = append(snap.Sessions, machineSession{
@@ -93,12 +94,12 @@ func listSessions(ctx context.Context, sessions extension.SessionService, attach
 	return snap, nil
 }
 
-func allSessions(ctx context.Context, list func(context.Context, extension.SessionFilter) (extension.SessionList, error)) ([]extension.SessionInfo, error) {
+func allSessions(ctx context.Context, list func(context.Context, extension.SessionFilter) (extension.SessionList, error), filter extension.SessionFilter) ([]extension.SessionInfo, error) {
 	var rows []extension.SessionInfo
 	matched := 0
 	seen := map[string]bool{}
 	cursors := map[string]bool{}
-	filter := extension.SessionFilter{Limit: 500}
+	filter.Limit = 500
 	for {
 		page, err := list(ctx, filter)
 		if err != nil {
@@ -230,15 +231,26 @@ var errNoSessions = errors.New("the board lent this command no session service")
 // subcommand. A server that is not running has none. Any other failure is
 // an error, so a host whose tmux cannot be run reads as unreachable with
 // the reason, rather than as a board with nothing to mirror.
-func tmuxSessions(ctx context.Context, run runner, argv []string) (map[string]bool, error) {
-	out, err := run(ctx, append(append([]string{}, argv...), "list-sessions", "-F", "#{session_name} #{session_attached}"))
+func tmuxSessions(ctx context.Context, run runner, argv []string) (map[string]bool, []machineSession, error) {
+	// tmux 3.8 replaces tabs in format output. Session names we use have no
+	// spaces, so split only the first two spaces and keep the directory whole.
+	out, err := run(ctx, append(append([]string{}, argv...), "list-sessions", "-F",
+		"#{session_name} #{"+terminalMark+"} #{pane_current_path}"))
 	if err != nil {
 		if tmuxHasNothing(err, false) {
-			return map[string]bool{}, nil
+			return map[string]bool{}, nil, nil
 		}
-		return nil, fmt.Errorf("could not list tmux sessions: %w", err)
+		return nil, nil, fmt.Errorf("could not list tmux sessions: %w", err)
 	}
-	return parseTmuxSessions(string(out)), nil
+	var terminals []machineSession
+	for _, line := range strings.Split(string(out), "\n") {
+		columns := strings.SplitN(line, " ", 3)
+		id, ok := strings.CutPrefix(columns[0], "gi_")
+		if len(columns) == 3 && columns[1] == "1" && ok && sessionIDPattern.MatchString(id) {
+			terminals = append(terminals, terminalSession(id, columns[2]))
+		}
+	}
+	return parseTmuxSessions(string(out)), terminals, nil
 }
 
 // tmuxHasNothing checks the final tmux diagnostic. Other socket errors

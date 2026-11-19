@@ -257,7 +257,7 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 			Fix: "install the same build on both"})
 	}
 	if !snap.boardRunning() {
-		step(checkStep{Name: "board running", Soft: true, Err: errors.New("board stopped"), Fix: "start that machine's board"})
+		step(checkStep{Name: "board running", Soft: true, Err: errors.New("board stopped"), Fix: boardStartHint(h)})
 		return result
 	}
 	step(checkStep{Name: "board running"})
@@ -279,6 +279,17 @@ func (e *Extension) probe(ctx context.Context, h host) probeResult {
 		step(checkStep{Name: "attachable session", Soft: true, Err: errors.New("no attachable sessions"), Fix: fix})
 	}
 	return result
+}
+
+func boardStartHint(h host) string {
+	hint := "on " + h.Destination + ", start Gate Inbox"
+	if h.Home != "" {
+		hint += " with board home " + h.Home
+	}
+	if h.TmuxSocket != "" {
+		hint += " on tmux socket " + h.TmuxSocket
+	}
+	return hint + ", then run Check again"
 }
 
 func (e *Extension) listOnce(ctx context.Context, h host) (snapshot, error) {

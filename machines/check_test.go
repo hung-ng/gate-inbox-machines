@@ -35,7 +35,7 @@ func TestCheckFailures(t *testing.T) {
 		{3, "not found", "", "make it available on PATH"},
 		{4, "", "garbage", "sessions reply FAIL"},
 		{4, "", `{"version":2}`, "same build on both"},
-		{5, "", `{"version":1,"board_running":false,"sessions":[]}`, "start that machine's board"},
+		{5, "", `{"version":1,"board_running":false,"sessions":[]}`, "on mini, start Gate Inbox"},
 		{6, "", `{"version":1,"sessions":[{"id":"a1"}]}`, "check tmux_socket"},
 	} {
 		t.Run(tc.want+tc.msg, func(t *testing.T) {
@@ -92,12 +92,12 @@ func TestCheckHealthyAndNamed(t *testing.T) {
 
 func TestSpawnReplyGreeting(t *testing.T) {
 	for _, s := range []string{`{"id":"ab12"}`, "hello from .zprofile\n{\n  \"id\": \"ab12\"\n}\n"} {
-		if err := parseSpawnReply([]byte(s)); err != nil {
+		if id, err := parseSpawnReply([]byte(s)); err != nil || id != "ab12" {
 			t.Fatal(err)
 		}
 	}
 	for _, s := range []string{"hello", `{"id":"bad id"}`} {
-		if parseSpawnReply([]byte(s)) == nil {
+		if _, err := parseSpawnReply([]byte(s)); err == nil {
 			t.Fatal(s)
 		}
 	}

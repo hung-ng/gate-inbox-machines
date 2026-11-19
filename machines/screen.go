@@ -3,7 +3,9 @@ package machines
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
@@ -15,6 +17,7 @@ import (
 const (
 	machinesScreen = "machines"
 	addScreen      = "machine_add"
+	removeScreen   = "machine_remove"
 )
 
 // Actions on the machines screen.
@@ -25,6 +28,7 @@ const (
 	actionRemove     = "remove"
 	actionBack       = "back"
 	actionNewSession = "new_session"
+	actionAdvanced   = "advanced"
 )
 
 func machinesKeys() []extension.KeyBinding {
@@ -36,7 +40,11 @@ func machinesKeys() []extension.KeyBinding {
 		{Screen: machinesScreen, Action: actionNewSession, Keys: []string{"n"}, Label: "new session there"},
 		{Screen: machinesScreen, Action: actionBack, Keys: []string{"esc"}, Label: "cancel or close"},
 		{Screen: machinesScreen, Action: extension.ActionClose, Keys: []string{"q"}, Label: "close"},
+		{Screen: addScreen, Action: extension.ActionSubmit, Keys: []string{"enter", "ctrl+s"}, Label: "connect"},
+		{Screen: addScreen, Action: actionAdvanced, Keys: []string{"alt+a"}, Label: "advanced"},
 		{Screen: addScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "back"},
+		{Screen: removeScreen, Action: actionRemove, Keys: []string{"y", "enter"}, Label: "remove"},
+		{Screen: removeScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "cancel"},
 	}
 }
 
@@ -62,7 +70,6 @@ type machinesView struct {
 	loading     bool
 	problem     string
 	note        []extension.Line
-	confirm     string
 	busy        bool
 }
 
@@ -156,9 +163,6 @@ func (v *machinesView) Render(width, height int) []extension.Line {
 			tail = append(tail, extension.Line{{Text: problem, Tone: extension.ToneBad}})
 		}
 	}
-	if v.confirm != "" {
-		tail = append(tail, extension.Line{{Text: "Remove " + v.confirm + "? Press y or Enter to archive its mirrors, or Esc to cancel. Its agents keep running.", Tone: extension.ToneWarn}})
-	}
 	if len(v.note) > 0 {
 		tail = append(append(tail, extension.Line{}), v.note...)
 	}
@@ -216,7 +220,7 @@ func (e *Extension) machineStatus(h host) (string, extension.Tone) {
 		return "not polled yet", extension.ToneMuted
 	}
 	if st.Err != "" {
-		return "offline since " + st.Since.Format("15:04") + ": " + lastLine(st.Err), extension.ToneBad
+		return "offline since " + st.Since.Format("15:04"), extension.ToneBad
 	}
 	parts := []string{"online"}
 	tone := extension.ToneGood
@@ -227,18 +231,9 @@ func (e *Extension) machineStatus(h host) (string, extension.Tone) {
 	if st.NotMirrored > 0 {
 		parts = append(parts, fmt.Sprintf("%d not mirrored", st.NotMirrored))
 	}
-	if h.About != nil {
-		if h.About.OS != "" {
-			parts = append(parts, h.About.OS)
-		}
-		switch v := h.About.Version; {
-		case v == "":
-		case v != Version:
-			parts = append(parts, "machines "+v+", this one "+Version)
-			tone = extension.ToneWarn
-		default:
-			parts = append(parts, "machines "+v)
-		}
+	if h.About != nil && h.About.Version != "" && h.About.Version != Version {
+		parts = append(parts, "version differs")
+		tone = extension.ToneWarn
 	}
 	return strings.Join(parts, " · "), tone
 }
@@ -253,26 +248,11 @@ func plural(n int, word string) string {
 func (v *machinesView) Key(k extension.ViewKey) bool {
 	v.mu.Lock()
 	rows := v.rowsLocked()
-	if name := v.confirm; name != "" {
-		confirmed := k.Key == "y" || k.Key == "enter"
-		if confirmed || k.Action == actionBack || k.Key == "esc" {
-			v.confirm = ""
-		}
-		v.mu.Unlock()
-		if confirmed {
-			v.run("removing "+name+"...", func() []extension.Line {
-				err := v.e.removeMachine(name)
-				v.e.wakeLoop(name)
-				return outcome(err, "Removed "+name+".")
-			})
-		}
-		v.handle.Refresh()
-		return false
-	}
 	var current row
 	if v.cursor < len(rows) {
 		current = rows[v.cursor]
 	}
+	busy := v.busy
 	switch k.Key {
 	case "up", "k":
 		v.cursor = max(v.cursor-1, 0)
@@ -325,12 +305,8 @@ func (v *machinesView) Key(k extension.ViewKey) bool {
 			})
 		}
 	case actionRemove:
-		if current.machine != nil {
-			v.mu.Lock()
-			if !v.busy {
-				v.confirm = current.machine.Name
-			}
-			v.mu.Unlock()
+		if current.machine != nil && !busy {
+			v.e.ui.Open(removeScreen, &removeView{e: v.e, ctx: v.ctx, name: current.machine.Name})
 		}
 	case actionBack:
 		return true
@@ -342,6 +318,42 @@ func (v *machinesView) Key(k extension.ViewKey) bool {
 	}
 	v.handle.Refresh()
 	return false
+}
+
+type removeView struct {
+	e    *Extension
+	ctx  context.Context
+	name string
+}
+
+func (*removeView) Title() string { return "Remove machine" }
+
+func (v *removeView) Render(width, _ int) []extension.Line {
+	return wrapLines([]extension.Line{
+		{{Text: "Remove " + v.name + " and archive its mirrors on this board?"}},
+		{{Text: "Remote sessions keep running."}},
+	}, width)
+}
+
+func (v *removeView) Key(k extension.ViewKey) bool {
+	if k.Action != actionRemove {
+		return false
+	}
+	go func() {
+		if err := v.e.removeMachine(v.name); err != nil {
+			v.e.ui.Notify("Could not remove " + v.name + ": " + err.Error())
+			return
+		}
+		v.e.wakeLoop(v.name)
+		v.e.ui.Notify("Removed " + v.name)
+	}()
+	return true
+}
+
+func (v *removeView) Closed(reason extension.CloseReason) {
+	if reason != extension.CloseReplaced {
+		v.e.openMachines(v.ctx)
+	}
 }
 
 // run does slow work off the board's loop, showing what it is doing and
@@ -422,34 +434,43 @@ type addForm struct {
 	handle      extension.ViewHandle
 	destination string
 
-	mu    sync.Mutex
-	lines []extension.Line
-	busy  bool
+	mu       sync.Mutex
+	lines    []extension.Line
+	busy     bool
+	advanced bool
 }
 
 func (f *addForm) Title() string { return "Add a machine" }
 
 func (f *addForm) Fields() []extension.Field {
-	return []extension.Field{
-		{ID: "destination", Label: "Destination", Value: f.destination, Placeholder: "alias, host, or user@host"},
-		{ID: "name", Label: "Name", Placeholder: "from its hostname"},
-		{ID: "group", Label: "Group", Placeholder: "top level"},
-		{ID: "gate_inbox", Label: "Binary path", Placeholder: "remote PATH"},
-		{ID: "home", Label: "Board home", Placeholder: "remote default"},
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fields := []extension.Field{
+		{ID: "destination", Label: "SSH host", Value: f.destination, Placeholder: "alias, host, or user@host"},
+		{ID: "name", Label: "Name", Placeholder: "optional: remote hostname"},
+		{ID: "group", Label: "Local group", Placeholder: "optional: root"},
 	}
+	if !f.advanced {
+		return fields
+	}
+	return append(fields,
+		extension.Field{ID: "gate_inbox", Label: "Binary path", Placeholder: "remote PATH"},
+		extension.Field{ID: "home", Label: "Board home", Placeholder: "remote default"},
+	)
 }
 
 func (f *addForm) Render(width, _ int) []extension.Line {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.lines) == 0 {
-		return wrapLines([]extension.Line{{{Text: "Only Destination is required. The board checks SSH and the remote Gate Inbox build when you submit."}}}, width)
-	}
 	return wrapLines(f.lines, width)
 }
 
 func (f *addForm) Key(k extension.ViewKey) bool {
 	switch k.Action {
+	case actionAdvanced:
+		f.mu.Lock()
+		f.advanced = true
+		f.mu.Unlock()
 	case extension.ActionSubmit:
 		opts := addOptions{Destination: k.Values["destination"], Name: k.Values["name"], Group: k.Values["group"],
 			GateInbox: k.Values["gate_inbox"], Home: k.Values["home"]}
@@ -459,7 +480,7 @@ func (f *addForm) Key(k extension.ViewKey) bool {
 			return false
 		}
 		f.busy = true
-		f.lines = []extension.Line{{{Text: "Checking " + strings.TrimSpace(opts.Destination) + "..."}}}
+		f.lines = []extension.Line{{{Text: "Checking SSH to " + strings.TrimSpace(opts.Destination) + "…"}}}
 		f.mu.Unlock()
 		go f.add(opts)
 
@@ -468,26 +489,25 @@ func (f *addForm) Key(k extension.ViewKey) bool {
 }
 
 func (f *addForm) add(opts addOptions) {
-	var out bytes.Buffer
-	h, err := f.e.addMachine(f.ctx, opts, &out)
-	lines := textLines(out.String(), true)
-	f.mu.Lock()
-	f.busy = false
-	f.mu.Unlock()
-	if err != nil {
-		lines = append(lines, extension.Line{{Text: err.Error(), Tone: extension.ToneBad}})
-	} else {
+	h, err := f.e.addMachine(f.ctx, opts, io.Discard)
+	if err == nil {
 		f.e.ui.Notify("Added " + h.Name + " (" + h.Destination + ")")
 		f.e.wakeLoop(h.Name)
 		f.handle.Close()
 		return
 	}
-	f.setLines(lines)
-}
-
-func (f *addForm) setLines(lines []extension.Line) {
+	lines := []extension.Line{{{Text: err.Error(), Tone: extension.ToneBad}}}
+	var checkErr *addCheckError
+	if errors.As(err, &checkErr) {
+		step := checkErr.step
+		lines = []extension.Line{
+			{{Text: fmt.Sprintf("%s failed for %s", step.Name, checkErr.destination), Tone: extension.ToneBad}},
+			{{Text: step.Fix}},
+			{{Text: lastLine(step.Err.Error()), Tone: extension.ToneMuted}},
+		}
+	}
 	f.mu.Lock()
-	f.lines = lines
+	f.lines, f.busy = lines, false
 	f.mu.Unlock()
 	f.handle.Refresh()
 }

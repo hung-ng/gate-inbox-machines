@@ -34,7 +34,7 @@ const sshFailed = 255
 
 const (
 	firstRetry = time.Second
-	maxRetry   = 30 * time.Second
+	maxRetry   = 10 * time.Second
 )
 
 // attachLoop keeps a mirror's pane attached to its session until the pane

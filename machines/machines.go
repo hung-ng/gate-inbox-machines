@@ -182,7 +182,7 @@ const (
 func (e *Extension) Commands() []extension.Command {
 	return []extension.Command{{
 		Name:  "machines",
-		Usage: "machines <add|list|remove|pause|resume|check|sessions|tools|attach>",
+		Usage: "machines <add|list|remove|pause|resume|check|sessions|tools|terminal|attach>",
 		About: "add and manage the other machines whose agents this board shows, and answer their boards",
 		Run:   e.runMachines,
 	}}
@@ -205,8 +205,13 @@ func (e *Extension) runMachines(ctx context.Context, args []string, host extensi
 		},
 		{
 			Name: "tools", Usage: usageTools,
-			About: "list the installed agent CLIs on this machine",
+			About: "list the available launch tools on this machine",
 			Run:   func(args []string) error { return runTools(ctx, args, host) },
+		},
+		{
+			Name: "terminal", Usage: usageTerminal,
+			About: "open a terminal on this machine for the controller to mirror",
+			Run:   operatorOnly("terminal", func(args []string) error { return e.runTerminal(ctx, args, host) }),
 		},
 		{
 			Name: "attach", Usage: usageAttach,
@@ -271,7 +276,7 @@ func (e *Extension) runSessions(ctx context.Context, args []string, host extensi
 	if *socket != "" {
 		tmuxArgv = append(tmuxArgv, "-L", *socket)
 	}
-	attachable, err := tmuxSessions(ctx, e.run, tmuxArgv)
+	attachable, terminals, err := tmuxSessions(ctx, e.run, tmuxArgv)
 	if err != nil {
 		return err
 	}
@@ -279,6 +284,7 @@ func (e *Extension) runSessions(ctx context.Context, args []string, host extensi
 	if err != nil {
 		return err
 	}
+	snap.Sessions = append(snap.Sessions, terminals...)
 	snap.BoardRunning = boolPtr(boardRunning(host.ConfigDir()))
 	self := describeSelf(host.ConfigDir(), *tmux)
 	snap.About = &self
@@ -292,6 +298,9 @@ func (e *Extension) runSessions(ctx context.Context, args []string, host extensi
 	snap.Tools, err = availableTools(ctx, host)
 	if err != nil {
 		return err
+	}
+	if *asJSON {
+		snap.Stats = readWorkerStats(ctx)
 	}
 	return cmdline.Emit(os.Stdout, *asJSON, snap, formatSnapshot(snap))
 }
@@ -371,12 +380,12 @@ func (e *Extension) savedMirrorTarget(localID string) (string, error) {
 	key := saved.target(localID)
 	name, id := splitKey(key)
 	if name == "" || !sessionIDPattern.MatchString(id) {
-		return "", fmt.Errorf("no target in %s for row %s", stateFile, localID)
+		return "", fmt.Errorf("this mirror has no saved target. Its remote session may have ended or its machine was removed")
 	}
 	reg := e.machines()
 	reg.reload()
 	if _, ok := reg.host(name); !ok {
-		return "", fmt.Errorf("machine %q is missing from %s", name, storeFileName)
+		return "", fmt.Errorf("this mirror's machine %q was removed. Add it again to see its running sessions", name)
 	}
 	return key, nil
 }

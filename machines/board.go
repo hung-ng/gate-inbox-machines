@@ -113,12 +113,15 @@ type mirrors struct {
 	failed     map[string]time.Time
 	badges     map[string]string
 	dirs       map[string]string
+	tools      map[string]string
+	readings   map[string]workerReading
 	lastErr    map[string]string
 	skipped    map[string]int
 	wake       <-chan string
 	since      map[string]time.Time
 	stopped    map[string]bool
 	owned      map[string]bool
+	health     map[string]string
 	// reg is where the machines come from, read again every pass so one
 	// added or paused from a shell shows up without a restart.
 	reg *registry
@@ -142,6 +145,7 @@ func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logge
 		failed:  map[string]time.Time{},
 		badges:  map[string]string{},
 		dirs:    map[string]string{},
+		tools:   map[string]string{},
 		lastErr: map[string]string{},
 		skipped: map[string]int{},
 		since:   map[string]time.Time{},
@@ -246,6 +250,11 @@ func (m *mirrors) pass(ctx context.Context) {
 	m.dirty = m.dirty || !sameState(m.state, next)
 	m.state = next
 	m.decorate(observed, local)
+	if m.ui != nil && m.status != nil {
+		if note := m.status.launchNotices(m.now(), m.state.Mirrors, m.failed); note != "" {
+			m.ui.Notify(note)
+		}
+	}
 }
 
 func (m *mirrors) forget(id string) {
@@ -255,6 +264,7 @@ func (m *mirrors) forget(id string) {
 	delete(m.pinned, id)
 	delete(m.badges, id)
 	delete(m.dirs, id)
+	delete(m.tools, id)
 	delete(m.owned, id)
 }
 
@@ -362,7 +372,7 @@ func (m *mirrors) observeOne(ctx context.Context, h host) observation {
 // localRows is every unarchived mirror row on this board.
 func (m *mirrors) localRows(ctx context.Context) (map[string]extension.SessionInfo, error) {
 	local := map[string]extension.SessionInfo{}
-	rows, err := allSessions(ctx, m.board.List)
+	rows, err := allSessions(ctx, m.board.List, extension.SessionFilter{})
 	if err != nil {
 		return nil, err
 	}
@@ -451,16 +461,29 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 	reachable := map[string]bool{}
 	sessions := map[string]machineSession{}
 	stopped := map[string]bool{}
+	stats := map[string]*workerStats{}
 	for _, obs := range observed {
 		reachable[obs.Host.Name] = obs.Err == nil
 		stopped[obs.Host.Name] = !obs.Snapshot.boardRunning()
+		if obs.Err == nil {
+			stats[obs.Host.Name] = obs.Snapshot.Stats
+		}
 		for _, s := range obs.Snapshot.Sessions {
 			sessions[mirrorKey(obs.Host.Name, s.ID)] = s
 		}
 	}
+	readings := map[string]workerReading{}
+	for _, h := range m.reg.all() {
+		readings[h.Name] = m.readings[h.Name].update(stats[h.Name])
+	}
+	m.readings = readings
+	waiting := map[string]int{}
 	for _, key := range sortedKeys(m.state.Mirrors) {
 		id := m.state.Mirrors[key]
-		hostName, sessionID := splitKey(key)
+		hostName, _ := splitKey(key)
+		if local[id].Status == "waiting" {
+			waiting[hostName]++
+		}
 		badge := extension.Badge{}
 		machine, _ := m.reg.host(hostName)
 		owned := machine.Paused || !reachable[hostName] || stopped[hostName]
@@ -472,22 +495,39 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 		if session.Directory != "" {
 			m.dirs[id] = session.Directory
 		}
-		fact := hostName + " · " + session.Tool + " · " + session.Status + " · gi_" + sessionID
+		if session.Tool != "" {
+			m.tools[id] = session.Tool
+		}
+		remoteTool := m.tools[id]
+		fact := hostName
+		if remoteTool != "" {
+			fact = remoteTool + " on " + hostName
+		}
+		if reading := readings[hostName]; reading.summary != "" {
+			if reading.stale {
+				fact += " · stale stats"
+			}
+			fact += " · " + reading.summary
+		}
+		detail := session.Status
 		switch {
 		case machine.Paused:
 			badge = extension.Badge{Text: "Ⅱ " + hostName + " paused", Short: "Ⅱ", Tone: extension.ToneWarn}
-			fact = hostName + " · polling paused · gi_" + sessionID
+			detail = "polling paused"
 		case !reachable[hostName]:
 			badge = extension.Badge{Text: "✕ " + hostName + " offline", Short: "✕", Tone: extension.ToneBad}
-			fact = hostName + " · unreachable since " + m.since[hostName].Format("15:04") + " · gi_" + sessionID
+			detail = "unreachable since " + m.since[hostName].Format("15:04")
 		case stopped[hostName]:
 			badge = extension.Badge{Text: "✕ " + hostName + " board stopped", Short: "✕", Tone: extension.ToneBad}
-			fact = hostName + " · no status until you start that machine's board · gi_" + sessionID
+			detail = "no status until you start that machine's board"
 		case session.Scrolling:
 			badge = extension.Badge{Text: "↕ scroll mode", Short: "↕", Tone: extension.ToneWarn}
-			fact = hostName + " · " + session.Tool + " · " + session.Status + " · scroll mode: press q inside the mirror to type again · gi_" + sessionID
+			detail = session.Status + " · scroll mode: press q inside the mirror to type again"
 		case local[id].ID != "" && !local[id].Running:
 			badge = extension.Badge{Text: "⇄ " + hostName + " detached", Short: "⇄ ·", Tone: extension.ToneWarn}
+		}
+		if detail != "" {
+			fact += " · " + detail
 		}
 		if dir := m.dirs[id]; dir != "" {
 			// The stock sidebar hides the entire detail block if it takes
@@ -500,16 +540,67 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 		} else if !owned && badge.Text == "" && session.Status == "waiting" {
 			fact += " · Press Enter to read and answer on the remote machine"
 		}
-		if m.badges[id] == badge.Text+fact {
+		if m.badges[id] == badge.Text+"\n"+fact {
 			continue
 		}
-		m.badges[id] = badge.Text + fact
-		if badge.Text == "" {
-			m.ui.Decorate(id)
-		} else {
-			m.ui.Decorate(id, badge)
+		m.badges[id] = badge.Text + "\n" + fact
+		var badges []extension.Badge
+		if badge.Text != "" {
+			badges = append(badges, badge)
 		}
-		m.ui.Fact(id, extension.Fact{Label: "machine", Text: fact})
+		if remoteTool != "" {
+			identity := extension.Badge{Text: remoteTool + " · " + hostName, Short: remoteTool, Tone: extension.ToneAccent}
+			if badge.Text == "" {
+				identity.Placement = extension.PlaceAfterName
+			}
+			badges = append(badges, identity)
+		}
+		m.ui.Decorate(id, badges...)
+		m.ui.Fact(id, extension.Fact{Label: "remote", Text: fact})
+	}
+	m.notifyHealth(reachable, stopped, waiting)
+}
+
+func (m *mirrors) notifyHealth(reachable, stopped map[string]bool, waiting map[string]int) {
+	health := map[string]string{}
+	var notices, paused []string
+	for _, h := range m.reg.all() {
+		state := "online"
+		switch {
+		case h.Paused:
+			state = "polling paused"
+		case !reachable[h.Name]:
+			state = "unreachable"
+		case stopped[h.Name]:
+			state = "board stopped"
+		}
+		health[h.Name] = state
+		previous := m.health[h.Name]
+		if previous == state {
+			continue
+		}
+		if state == "online" {
+			if previous != "" {
+				notices = append(notices, h.Name+" back online")
+			}
+			continue
+		}
+		if m.health == nil && h.Paused {
+			paused = append(paused, h.Name)
+			continue
+		}
+		note := h.Name + " " + state
+		if count := waiting[h.Name]; count > 0 {
+			note += fmt.Sprintf(" (%d waiting outside triage)", count)
+		}
+		notices = append(notices, note)
+	}
+	if len(paused) > 0 {
+		notices = append(notices, "Polling paused on "+strings.Join(paused, ", "))
+	}
+	m.health = health
+	if len(notices) > 0 {
+		m.ui.Notify(strings.Join(notices, " · "))
 	}
 }
 

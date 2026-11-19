@@ -29,6 +29,15 @@ type addOptions struct {
 	Force bool
 }
 
+type addCheckError struct {
+	destination string
+	step        checkStep
+}
+
+func (err *addCheckError) Error() string {
+	return fmt.Sprintf("%s was not added: %s failed; fix that and add it again, or pass --force to add it anyway", err.destination, err.step.Name)
+}
+
 // validDestination refuses a destination ssh would read as something else.
 func validDestination(d string) error {
 	switch {
@@ -94,7 +103,7 @@ func (e *Extension) addMachine(ctx context.Context, opts addOptions, out io.Writ
 	result := forAdding(e.probe(ctx, probeHost))
 	result.print(out, opts.Destination)
 	if blocked := result.blocking(); blocked != nil && !opts.Force {
-		return host{}, fmt.Errorf("%s was not added: %s failed; fix that and add it again, or pass --force to add it anyway", opts.Destination, blocked.Name)
+		return host{}, &addCheckError{opts.Destination, *blocked}
 	}
 	// The LAN address of a machine already on the board passes every
 	// check: what it reports about itself is what tells them apart.
@@ -165,8 +174,6 @@ func forAdding(result probeResult) probeResult {
 		switch {
 		case step.Name == "gate-inbox" && notFound(step.Err):
 			result.Steps[i].Fix = "no gate-inbox there, even through your login shell; give this build's full path there as the gate-inbox path (--gate-inbox)"
-		case step.Name == "board running":
-			result.Steps[i].Fix = "start that machine's board; if it runs with GATE_INBOX_HOME, give that as the board home (--home)"
 		case step.Name == "attachable session":
 			result.Steps[i].Fix = notMirroredFix
 		}

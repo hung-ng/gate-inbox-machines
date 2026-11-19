@@ -1,6 +1,7 @@
 package machines
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,6 +28,36 @@ type statusBoard struct {
 	states    map[string]machineState
 	listeners map[int]func()
 	next      int
+	launches  map[string]time.Time
+}
+
+func (b *statusBoard) trackLaunch(key string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.launches == nil {
+		b.launches = map[string]time.Time{}
+	}
+	b.launches[key] = time.Now().Add(time.Minute)
+}
+
+// launchNotices reports the local result of launches confirmed by a worker.
+func (b *statusBoard) launchNotices(now time.Time, mirrored map[string]string, failed map[string]time.Time) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var notes []string
+	for _, key := range sortedKeys(b.launches) {
+		machine, _ := splitKey(key)
+		switch {
+		case mirrored[key] != "":
+			notes = append(notes, "Mirror ready for session on "+machine)
+		case failed[key].After(now) || !now.Before(b.launches[key]):
+			notes = append(notes, "Session started on "+machine+" · mirror unavailable")
+		default:
+			continue
+		}
+		delete(b.launches, key)
+	}
+	return strings.Join(notes, " · ")
 }
 
 func (b *statusBoard) set(states map[string]machineState) {

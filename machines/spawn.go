@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -14,15 +15,30 @@ import (
 )
 
 const spawnScreen = "machine_spawn"
+const remoteTerminal = "terminal"
 
-func spawnArgv(cfg config, h host, cli, task, directory string) []string {
-	args := []string{"spawn", "--nest=false", "--tool", cli}
-	if task != "" {
-		args = append(args, "--prompt", task)
+type spawnOptions struct {
+	tool, model, name, prompt, group, directory string
+}
+
+func spawnArgv(cfg config, h host, opts spawnOptions) []string {
+	args := []string{"spawn", "--nest=false", "--tool", opts.tool}
+	if opts.tool == remoteTerminal {
+		args = []string{"machines", "terminal", "--tmux", h.Tmux}
+	}
+	for _, option := range [][2]string{
+		{"--model", opts.model},
+		{"--name", opts.name},
+		{"--prompt", opts.prompt},
+		{"--group", opts.group},
+	} {
+		if option[1] != "" {
+			args = append(args, option[0], option[1])
+		}
 	}
 	command := machineCommand(h, h.GateInbox, args...)
-	if directory != "" {
-		command += " --directory " + shellPath(directory)
+	if opts.directory != "" {
+		command += " --directory " + shellPath(opts.directory)
 	}
 	return loginShell(cfg, h.Destination, command+" --json")
 }
@@ -33,11 +49,22 @@ func availableTools(ctx context.Context, h extension.Host) ([]string, error) {
 		return nil, err
 	}
 	var names []string
+	var shell bool
 	for _, tool := range tools {
-		if tool.Shell || tool.Name == "terminal" || tool.Name == toolName || tool.Name == "machines" {
+		if tool.Name == toolName || tool.Name == "machines" {
+			continue
+		}
+		if tool.Shell {
+			shell = true
+			continue
+		}
+		if tool.Name == remoteTerminal {
 			continue
 		}
 		names = append(names, tool.Name)
+	}
+	if shell {
+		names = append(names, remoteTerminal)
 	}
 	return names, nil
 }
@@ -60,7 +87,8 @@ func (e *Extension) machineUI() extension.UI {
 				e.openMachines(ctx)
 				return nil
 			}},
-		{Screen: spawnScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "close"},
+		{Screen: spawnScreen, Action: extension.ActionSubmit, Keys: []string{"enter", "ctrl+s"}, Label: "create"},
+		{Screen: spawnScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "cancel"},
 	}
 	keys = append(keys, dismissKeys(e)...)
 	return extension.UI{Keys: append(keys, machinesKeys()...)}
@@ -90,37 +118,44 @@ type spawnForm struct {
 	names  []string
 	handle extension.ViewHandle
 
-	mu      sync.Mutex
-	machine string
-	tools   []string
-	loading bool
-	err     error
-	cancel  context.CancelFunc
+	mu          sync.Mutex
+	machine     string
+	tools       []string
+	loading     bool
+	err         error
+	cancel      context.CancelFunc
+	starting    bool
+	launchError string
+	closed      bool
 }
 
-func (f *spawnForm) Title() string { return "New session on another machine" }
+func (f *spawnForm) Title() string { return "New Session" }
 func (f *spawnForm) Render(width, _ int) []extension.Line {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var text string
 	switch {
 	case f.machine == "":
-		text = "Select a machine and press Enter to check its installed CLIs."
+		text = "Select a machine, then press Enter to load its tools."
 	case f.loading:
 		text = "Checking installed CLIs on " + f.machine + "…"
+	case f.starting:
+		text = "Starting on " + f.machine + "…"
+	case f.launchError != "":
+		return wrapLines([]extension.Line{{{Text: f.launchError, Tone: extension.ToneBad}}}, width)
 	case f.err != nil:
 		text = "Could not check installed CLIs. Enter a CLI name or choose another machine."
 	case len(f.tools) == 0:
 		text = "No agent CLI is installed on " + f.machine + ". Install one there and reopen this form."
 	default:
-		text = "Choose a CLI, enter a task and submit."
+		return nil
 	}
 	return wrapLines([]extension.Line{{{Text: text}}}, width)
 }
 func (f *spawnForm) Fields() []extension.Field {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	fields := []extension.Field{{ID: "machine", Label: "Machine", Choices: f.names, Value: f.machine}}
+	fields := []extension.Field{{ID: "machine", Label: "machine", Choices: f.names, Value: f.machine}}
 	if f.machine == "" || (len(f.tools) == 0 && f.err == nil) {
 		return fields
 	}
@@ -129,9 +164,12 @@ func (f *spawnForm) Fields() []extension.Field {
 		choices = nil
 	}
 	return append(fields,
-		extension.Field{ID: "cli", Label: "CLI", Choices: choices, Placeholder: "CLI name"},
-		extension.Field{ID: "task", Label: "Task"},
-		extension.Field{ID: "directory", Label: "Directory", Placeholder: "that board's default"})
+		extension.Field{ID: "cli", Label: "tool", Choices: choices, Placeholder: "CLI name"},
+		extension.Field{ID: "model", Label: "model", Placeholder: "default"},
+		extension.Field{ID: "name", Label: "name", Placeholder: "optional: the agent names it"},
+		extension.Field{ID: "task", Label: "prompt", Placeholder: "first task (optional)"},
+		extension.Field{ID: "group", Label: "group", Placeholder: "remote root"},
+		extension.Field{ID: "directory", Label: "dir", Placeholder: "remote default"})
 }
 func (f *spawnForm) Key(k extension.ViewKey) bool {
 	if k.Action != extension.ActionSubmit {
@@ -139,9 +177,13 @@ func (f *spawnForm) Key(k extension.ViewKey) bool {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.starting {
+		return false
+	}
 	name := k.Values["machine"]
 	h, ok := f.e.machines().host(name)
 	if !ok || h.Paused {
+		f.launchError = "Choose a machine that is not paused."
 		return false
 	}
 	if f.machine != name {
@@ -151,26 +193,60 @@ func (f *spawnForm) Key(k extension.ViewKey) bool {
 	if f.loading || (len(f.tools) == 0 && f.err == nil) {
 		return false
 	}
-	cli, task, directory := k.Values["cli"], k.Values["task"], k.Values["directory"]
-	if strings.TrimSpace(cli) == "" || (f.err == nil && !slices.Contains(f.tools, cli)) {
-		f.e.ui.Notify("Choose an agent CLI")
+	opts := spawnOptions{
+		tool: strings.TrimSpace(k.Values["cli"]), model: k.Values["model"], name: k.Values["name"],
+		prompt: k.Values["task"], group: k.Values["group"], directory: k.Values["directory"],
+	}
+	if opts.tool == "" || opts.tool == toolName || opts.tool == "machines" || (f.err == nil && !slices.Contains(f.tools, opts.tool)) {
+		f.launchError = "Choose an installed CLI."
 		return false
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(f.ctx, 30*time.Second)
-		defer cancel()
-		out, err := f.e.run(ctx, spawnArgv(f.e.cfg, h, cli, task, directory))
-		if err == nil {
-			err = parseSpawnReply(out)
+	if opts.tool == remoteTerminal {
+		if f.err != nil {
+			f.launchError = "Could not confirm Terminal support. Run Check on that machine."
+			return false
 		}
-		if err != nil {
-			f.e.ui.Notify("Could not start session on " + name + ": " + err.Error())
-		} else {
-			f.e.ui.Notify("Started session on " + name)
+		if opts.model != "" || opts.name != "" || opts.prompt != "" || opts.group != "" {
+			f.launchError = "Terminal uses dir. Clear model, name, prompt, and group to create it."
+			return false
 		}
-		f.e.wakeLoop(name)
-	}()
-	return true
+	}
+	f.starting, f.launchError = true, ""
+	go f.start(h, opts)
+	return false
+}
+
+func (f *spawnForm) start(h host, opts spawnOptions) {
+	ctx, cancel := context.WithTimeout(f.ctx, 30*time.Second)
+	defer cancel()
+	out, err := f.e.run(ctx, spawnArgv(f.e.cfg, h, opts))
+	id, replyErr := parseSpawnReply(out)
+	var failure string
+	var exit exitCoder
+	switch {
+	case ctx.Err() != nil || (errors.As(err, &exit) && exit.ExitCode() == sshFailed):
+		failure = "Could not confirm launch on " + h.Name + ". Check that machine before retrying."
+	case err != nil:
+		failure = "Could not start on " + h.Name + ": " + lastLine(err.Error())
+	case replyErr != nil:
+		failure = "Could not confirm launch on " + h.Name + ". Check that machine before retrying."
+	}
+	f.mu.Lock()
+	f.starting, f.launchError = failure == "", failure
+	closed := f.closed
+	f.mu.Unlock()
+	if failure == "" {
+		f.e.ui.Notify("Started on " + h.Name + " · waiting for mirror")
+		f.e.status.trackLaunch(mirrorKey(h.Name, id))
+		if f.handle != nil {
+			f.handle.Close()
+		}
+	} else if closed {
+		f.e.ui.Notify(failure)
+	} else if f.handle != nil {
+		f.handle.Refresh()
+	}
+	f.e.wakeLoop(h.Name)
 }
 
 // check runs the probe in the same login shell as a spawn. A new machine
@@ -181,7 +257,7 @@ func (f *spawnForm) check(h host) {
 	}
 	ctx, cancel := context.WithCancel(f.ctx)
 	f.cancel = cancel
-	f.machine, f.loading = h.Name, true
+	f.machine, f.loading, f.launchError = h.Name, true, ""
 	go func() {
 		probe, stop := context.WithTimeout(ctx, 15*time.Second)
 		defer stop()
@@ -203,6 +279,7 @@ func (f *spawnForm) check(h host) {
 func (f *spawnForm) Closed(extension.CloseReason) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.closed = true
 	if f.cancel != nil {
 		f.cancel()
 	}
@@ -210,13 +287,13 @@ func (f *spawnForm) Closed(extension.CloseReason) {
 
 // Login files sometimes print a greeting. Accept a JSON reply after it,
 // but require a session id so a successful shell alone is not a spawn.
-func parseSpawnReply(out []byte) error {
+func parseSpawnReply(out []byte) (string, error) {
 	for offset := 0; offset < len(out); {
 		var reply struct {
 			ID string `json:"id"`
 		}
 		if json.NewDecoder(bytes.NewReader(out[offset:])).Decode(&reply) == nil && sessionIDPattern.MatchString(reply.ID) {
-			return nil
+			return reply.ID, nil
 		}
 		i := bytes.IndexByte(out[offset:], '\n')
 		if i < 0 {
@@ -224,5 +301,5 @@ func parseSpawnReply(out []byte) error {
 		}
 		offset += i + 1
 	}
-	return fmt.Errorf("the machine's spawn reply contains no session id")
+	return "", fmt.Errorf("the machine's spawn reply contains no session id")
 }

@@ -39,7 +39,8 @@ func TestListSessionsReadsEveryPageAndLeavesOutMirrors(t *testing.T) {
 	sessions := &fakeSessions{pages: [][]extension.SessionInfo{
 		{
 			{ID: "a1", Name: "api", Tool: "claude", Status: "working", Running: true},
-			{ID: "b2", Name: "shell", Terminal: true, Running: true},
+			{ID: "b2", Name: "shell", Tool: "terminal", Terminal: true, Running: true},
+			{ID: "b3", Name: "child shell", Tool: "terminal", Terminal: true, Running: true, ParentID: "a1"},
 		},
 		{
 			{ID: "c3", Name: "mirror of laptop", Tool: "machines", Role: mirrorRole, Running: true},
@@ -55,8 +56,8 @@ func TestListSessionsReadsEveryPageAndLeavesOutMirrors(t *testing.T) {
 	for _, s := range snap.Sessions {
 		ids = append(ids, s.ID)
 	}
-	if strings.Join(ids, ",") != "a1,d4" {
-		t.Errorf("listed %v, want a1 and d4: no terminal, no mirror, no hand-started machines tool", ids)
+	if strings.Join(ids, ",") != "a1,b2,d4" {
+		t.Errorf("listed %v, want the agents and top-level terminal only", ids)
 	}
 	if snap.Version != wireVersion {
 		t.Errorf("version = %d", snap.Version)
@@ -64,8 +65,8 @@ func TestListSessionsReadsEveryPageAndLeavesOutMirrors(t *testing.T) {
 	if !snap.Sessions[0].Attachable || snap.Sessions[1].Attachable {
 		t.Errorf("attachable = %v, %v; want only a1, which has a gi_ session", snap.Sessions[0].Attachable, snap.Sessions[1].Attachable)
 	}
-	if snap.Sessions[1].Directory != "/home/user/docs project" {
-		t.Fatal(snap.Sessions[1])
+	if snap.Sessions[2].Directory != "/home/user/docs project" {
+		t.Fatal(snap.Sessions[2])
 	}
 	// What one end prints, the other end reads.
 	var buf bytes.Buffer

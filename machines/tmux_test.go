@@ -3,6 +3,7 @@ package machines
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -21,7 +22,7 @@ func TestTmuxSessionsReadsNoServerAsNoSessions(t *testing.T) {
 		"exit status 1: error connecting to /private/tmp/tmux-501/agents (No such file or directory)",
 	} {
 		run := func(context.Context, []string) ([]byte, error) { return nil, errors.New(msg) }
-		got, err := tmuxSessions(context.Background(), run, []string{"tmux"})
+		got, _, err := tmuxSessions(context.Background(), run, []string{"tmux"})
 		if err != nil || len(got) != 0 {
 			t.Errorf("%q: got %v, %v; want no sessions and no error", msg, got, err)
 		}
@@ -29,7 +30,7 @@ func TestTmuxSessionsReadsNoServerAsNoSessions(t *testing.T) {
 	run := func(context.Context, []string) ([]byte, error) {
 		return nil, errors.New(`exec: "tmux": executable file not found in $PATH`)
 	}
-	if _, err := tmuxSessions(context.Background(), run, []string{"tmux"}); err == nil {
+	if _, _, err := tmuxSessions(context.Background(), run, []string{"tmux"}); err == nil {
 		t.Error("a tmux that cannot run listed nothing, want an error")
 	}
 }
@@ -52,12 +53,30 @@ func TestTmuxSessionsOnARealServer(t *testing.T) {
 			t.Fatalf("start %s: %v %s", name, err, out)
 		}
 	}
-	got, err := tmuxSessions(context.Background(), execRunner, server)
+	got, _, err := tmuxSessions(context.Background(), execRunner, server)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || !got["ab12"] {
 		t.Errorf("attachable = %v, want ab12 only", got)
+	}
+
+	work := filepath.Join(t.TempDir(), "work with spaces")
+	if err := os.Mkdir(work, 0700); err != nil {
+		t.Fatal(err)
+	}
+	work, err = filepath.EvalSymlinks(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := append(append([]string{}, server...), "new-session", "-d", "-s", "gi_ef12", "-c", work, "sleep 30",
+		";", "set-option", "-t", "gi_ef12", terminalMark, "1")
+	if _, err := execRunner(context.Background(), terminal); err != nil {
+		t.Fatal(err)
+	}
+	attachable, terminals, err := tmuxSessions(context.Background(), execRunner, server)
+	if err != nil || !attachable["ab12"] || !attachable["ef12"] || len(terminals) != 1 || terminals[0].ID != "ef12" || terminals[0].Directory != work {
+		t.Fatal(attachable, terminals, err)
 	}
 
 	modes, err := tmuxScrolling(context.Background(), execRunner, server)
@@ -79,7 +98,7 @@ func TestTmuxSessionsOnARealServer(t *testing.T) {
 		t.Fatal(modes, err)
 	}
 	none := []string{tmux, "-f", "/dev/null", "-S", filepath.Join(t.TempDir(), "none")}
-	if got, err := tmuxSessions(context.Background(), execRunner, none); err != nil || len(got) != 0 {
+	if got, _, err := tmuxSessions(context.Background(), execRunner, none); err != nil || len(got) != 0 {
 		t.Errorf("no server: got %v, %v", got, err)
 	}
 }
@@ -104,7 +123,7 @@ func TestTmuxListingsOnAnEmptyServer(t *testing.T) {
 	if out, err := exec.Command(tmux, "-S", socket, "show", "-s", "exit-empty").CombinedOutput(); err != nil {
 		t.Fatalf("the empty server did not stay up: %v %s", err, out)
 	}
-	if got, err := tmuxSessions(context.Background(), execRunner, server); err != nil || len(got) != 0 {
+	if got, _, err := tmuxSessions(context.Background(), execRunner, server); err != nil || len(got) != 0 {
 		t.Errorf("sessions on an empty server: got %v, %v; want none and no error", got, err)
 	}
 	if got, err := tmuxScrolling(context.Background(), execRunner, server); err != nil || len(got) != 0 {
@@ -118,7 +137,7 @@ func TestTmuxListingsRejectSocketFailures(t *testing.T) {
 		"exit status 1: error connecting to /tmp/tmux-501/agents (Permission denied)",
 	} {
 		run := func(context.Context, []string) ([]byte, error) { return nil, errors.New(msg) }
-		if _, err := tmuxSessions(context.Background(), run, []string{"tmux"}); err == nil {
+		if _, _, err := tmuxSessions(context.Background(), run, []string{"tmux"}); err == nil {
 			t.Fatal("list-sessions accepted", msg)
 		}
 		if _, err := tmuxScrolling(context.Background(), run, []string{"tmux"}); err == nil {
@@ -128,7 +147,7 @@ func TestTmuxListingsRejectSocketFailures(t *testing.T) {
 	run := func(context.Context, []string) ([]byte, error) {
 		return nil, errors.New("exit status 1: no current target")
 	}
-	if _, err := tmuxSessions(context.Background(), run, []string{"tmux"}); err == nil {
+	if _, _, err := tmuxSessions(context.Background(), run, []string{"tmux"}); err == nil {
 		t.Fatal("list-sessions accepted no current target")
 	}
 	if got, err := tmuxScrolling(context.Background(), run, []string{"tmux"}); err != nil || len(got) != 0 {

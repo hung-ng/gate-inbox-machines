@@ -481,7 +481,7 @@ func TestPassKeepsPausedMirrorsAndDismissalsUntilRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.pass(ctx)
-	if !sameState(m.state, before) || len(b.launches) != 2 || u.owned["l1"] || u.badges["l1"] != "" {
+	if !sameState(m.state, before) || len(b.launches) != 2 || u.owned["l1"] || u.badges["l1"] != "claude · mini" {
 		t.Fatal(m.state, b.launches, u.owned, u.badges)
 	}
 	if err := m.reg.change(func(s *storeFile) error {
@@ -707,24 +707,23 @@ func TestMachinesScreenConfirmsRemoval(t *testing.T) {
 			e.ui = u
 			e.openMachines(context.Background())
 			_, view := u.last()
-			v := view.(*machinesView)
 			remove := extension.ViewKey{Action: actionRemove, Key: "x"}
-			v.Key(remove)
-			if len(e.machines().all()) != 1 || !strings.Contains(text(v.Render(120, 40)), "Remove box?") {
-				t.Fatal(text(v.Render(120, 40)))
+			view.(*machinesView).Key(remove)
+			screen, dialog := u.last()
+			if screen != removeScreen || !strings.Contains(text(dialog.Render(120, 40)), "Remote sessions keep running.") {
+				t.Fatal(screen, text(dialog.Render(120, 40)))
 			}
-			if v.Key(extension.ViewKey{Action: actionBack, Key: "esc"}) {
-				t.Fatal("Escape closed the screen instead of canceling removal")
+			dialog.(*removeView).Closed(extension.CloseDismissed)
+			screen, view = u.last()
+			if screen != machinesScreen || len(e.machines().all()) != 1 {
+				t.Fatal("Escape did not return without removing")
 			}
-			if v.confirm != "" || len(e.machines().all()) != 1 {
-				t.Fatal("Escape did not cancel removal")
+			view.(*machinesView).Key(remove)
+			_, dialog = u.last()
+			if !dialog.Key(extension.ViewKey{Key: confirm, Action: actionRemove}) {
+				t.Fatal("confirmation did not close the dialog")
 			}
-			v.Key(remove)
-			v.Key(extension.ViewKey{Key: confirm})
 			waitFor(t, "the removal", func() bool { return len(e.machines().all()) == 0 })
-			if !strings.Contains(text(v.Render(120, 40)), "No machines yet") {
-				t.Fatal(text(v.Render(120, 40)))
-			}
 		})
 	}
 }
@@ -997,15 +996,15 @@ func TestCheckSaysWhenEveryMachineIsPaused(t *testing.T) {
 	}
 }
 
-func TestMachineStatusShowsTheVersion(t *testing.T) {
+func TestMachineStatusOnlyFlagsVersionMismatch(t *testing.T) {
 	e := newManaged(t, healthyFar())
 	e.status.set(map[string]machineState{"box": {BoardRunning: true}})
 	h := host{Name: "box", About: &about{Version: Version}}
-	if status, _ := e.machineStatus(h); !strings.Contains(status, "machines "+Version) {
+	if status, _ := e.machineStatus(h); status != "online · 0 sessions" {
 		t.Fatal(status)
 	}
 	h.About.Version = "0.0.1"
-	if status, tone := e.machineStatus(h); !strings.Contains(status, "machines 0.0.1, this one "+Version) || tone != extension.ToneWarn {
+	if status, tone := e.machineStatus(h); !strings.Contains(status, "version differs") || tone != extension.ToneWarn {
 		t.Fatal(status, tone)
 	}
 }

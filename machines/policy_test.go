@@ -2,10 +2,12 @@ package machines
 
 import (
 	"context"
-	"github.com/usestring/gate-inbox/extension"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/usestring/gate-inbox/extension"
 )
 
 func TestLaunchGuardOnlyChecksExplicitMirrorRole(t *testing.T) {
@@ -25,5 +27,30 @@ func TestLaunchGuardOnlyChecksExplicitMirrorRole(t *testing.T) {
 		if _, err := e.LaunchEnv(context.Background(), launch); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestMirrorLaunchAndRestoreRequireTarget(t *testing.T) {
+	dir := t.TempDir()
+	e := New()
+	e.conf = extension.NewConfig(nil).WithDataDir(dir)
+	e.reg = newRegistry(machineStore(t, dir, mini))
+	ctx := context.Background()
+	launch := extension.Launch{Session: extension.SessionInfo{ID: "a1", Tool: toolName}}
+	if _, err := e.LaunchEnv(ctx, launch); err == nil || !strings.Contains(err.Error(), "Shift+n") {
+		t.Fatal(err)
+	}
+	launch.Session.Role = mirrorRole
+	launch.Reason = extension.LaunchRelaunch
+	if _, err := e.LaunchEnv(ctx, launch); err == nil || !strings.Contains(err.Error(), "no saved target") {
+		t.Fatal(err)
+	}
+	saved := newState()
+	saved.Dismissed["mini/b2"] = "a1"
+	if err := writeJSON(filepath.Join(dir, stateFile), saved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.LaunchEnv(ctx, launch); err != nil {
+		t.Fatal(err)
 	}
 }

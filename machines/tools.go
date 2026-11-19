@@ -47,6 +47,11 @@ func installedTools(ctx context.Context, host extension.Host) ([]string, error) 
 	}
 	ready := []string{}
 	for _, name := range names {
+		if name == remoteTerminal {
+			// The worker opens its terminal through tmux's default shell.
+			ready = append(ready, name)
+			continue
+		}
 		binary := name
 		// Gate Inbox's spawn checks the first word of the command.
 		if fields := strings.Fields(config.Tools[name].Command); len(fields) > 0 {

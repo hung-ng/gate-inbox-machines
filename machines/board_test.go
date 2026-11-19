@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -122,6 +123,13 @@ type fakeUI struct {
 	facts    map[string]string
 	owned    map[string]bool
 	ownCalls int
+	notices  []string
+}
+
+func (u *fakeUI) Notify(note string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.notices = append(u.notices, note)
 }
 
 func (u *fakeUI) Decorate(id string, badges ...extension.Badge) {
@@ -185,7 +193,7 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	if strings.Join(board.pins, ",") != "l1=waiting" {
 		t.Errorf("pins = %v", board.pins)
 	}
-	if ui.badges["l1"] != "" || ui.facts["l1"] != "mini · claude · waiting · gi_a1 · Press Enter to read and answer on the remote machine" {
+	if ui.badges["l1"] != "claude · mini" || ui.facts["l1"] != "claude on mini · waiting · Press Enter to read and answer on the remote machine" {
 		t.Errorf("badge %q fact %q", ui.badges["l1"], ui.facts["l1"])
 	}
 
@@ -209,7 +217,7 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	if got := board.sessions["l1"]; got.Status != "working" || !got.Running || len(board.archives) != 0 || m.state.Mirrors["mini/a1"] != "l1" {
 		t.Fatalf("restart changed the mirror: row %+v, archives %v, state %v", got, board.archives, m.state)
 	}
-	if got := ui.facts["l1"]; got != "mini · claude · working · gi_a1 · Remote dir: /srv/remote project" {
+	if got := ui.facts["l1"]; got != "claude on mini · working · Remote dir: /srv/remote project" {
 		t.Errorf("working mirror detail = %q", got)
 	}
 	m.pass(context.Background())
@@ -246,9 +254,60 @@ func TestWaitingMirrorKeepsLongDirectoryFactBrief(t *testing.T) {
 	ui := &fakeUI{badges: map[string]string{}, facts: map[string]string{}}
 	m := newMirrors(testConfig(), newFakeBoard(), ui, quiet(), reply.run, machineStore(t, t.TempDir(), mini))
 	m.pass(context.Background())
-	want := "mini · claude · waiting · gi_a1 · Remote dir: …lpha-build-directory"
+	want := "claude on mini · waiting · Remote dir: …lpha-build-directory"
 	if got := ui.facts["l1"]; got != want {
 		t.Errorf("waiting mirror detail = %q, want %q", got, want)
+	}
+}
+
+func TestMirrorShowsWorkerStatsAndMarksStaleReadings(t *testing.T) {
+	const gib = 1 << 30
+	session := live("a1", "waiting")
+	session.Directory = "/srv/worker"
+	snap := snapshot{Version: wireVersion, Sessions: []machineSession{session}}
+	reply := hosts{"mini": snap}
+	ui := &fakeUI{badges: map[string]string{}, facts: map[string]string{}}
+	m := newMirrors(testConfig(), newFakeBoard(), ui, quiet(), reply.run, machineStore(t, t.TempDir(), mini))
+	m.pass(context.Background())
+	if strings.Contains(ui.facts["l1"], "RAM") {
+		t.Fatal("an older worker did not report stats:", ui.facts["l1"])
+	}
+	reading := func(busy, total float64) snapshot {
+		snap.Stats = &workerStats{
+			CPU: &cpuCounters{Busy: busy, Total: total},
+			RAM: &ramStats{Used: 8.5 * gib, Total: 16 * gib},
+		}
+		return snap
+	}
+	reply["mini"] = reading(30, 100)
+	m.pass(context.Background())
+	if fact := ui.facts["l1"]; strings.Contains(fact, "CPU") || !strings.Contains(fact, "RAM 8.5/16 GiB") {
+		t.Fatal(fact)
+	}
+	reply["mini"] = reading(54, 200)
+	m.pass(context.Background())
+	if fact := ui.facts["l1"]; fact != "claude on mini · CPU 24% · RAM 8.5/16 GiB · waiting · Remote dir: /srv/worker" {
+		t.Fatal(fact)
+	}
+	reply["mini"] = context.DeadlineExceeded
+	m.pass(context.Background())
+	if fact := ui.facts["l1"]; !strings.Contains(fact, "stale stats · CPU 24% · RAM 8.5/16 GiB · unreachable") {
+		t.Fatal(fact)
+	}
+	reply["mini"] = reading(75, 300)
+	m.pass(context.Background())
+	if fact := ui.facts["l1"]; strings.Contains(fact, "CPU") || strings.Contains(fact, "stale") || !strings.Contains(fact, "RAM 8.5/16 GiB") {
+		t.Fatal(fact)
+	}
+	if err := m.reg.change(func(store *storeFile) error {
+		store.Paused = []string{"mini"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(context.Background())
+	if fact := ui.facts["l1"]; !strings.Contains(fact, "stale stats · RAM 8.5/16 GiB · polling paused") {
+		t.Fatal(fact)
 	}
 }
 
@@ -329,7 +388,7 @@ func TestUnavailableKeepsTheLastPinAndOwnsTheRow(t *testing.T) {
 			t.Fatal(b.pins, u.owned)
 		}
 		if offline {
-			if u.badges["l1"] != "✕ mini offline" || u.facts["l1"] != "mini · unreachable since 12:34 · gi_a1" {
+			if u.badges["l1"] != "✕ mini offline" || u.facts["l1"] != "claude on mini · unreachable since 12:34" {
 				t.Fatal(u.badges, u.facts)
 			}
 		} else if u.badges["l1"] != "✕ mini board stopped" || !strings.Contains(u.facts["l1"], "start that machine's board") {
@@ -338,8 +397,12 @@ func TestUnavailableKeepsTheLastPinAndOwnsTheRow(t *testing.T) {
 	}
 	replies["mini"] = snapshot{Version: wireVersion, BoardRunning: boolPtr(true), Sessions: []machineSession{live("a1", "waiting")}}
 	m.pass(context.Background())
-	if u.owned["l1"] || u.badges["l1"] != "" || strings.Join(b.pins, ",") != "l1=waiting" {
+	if u.owned["l1"] || u.badges["l1"] != "claude · mini" || strings.Join(b.pins, ",") != "l1=waiting" {
 		t.Fatal(u.owned, u.badges, b.pins)
+	}
+	m.pass(context.Background())
+	if want := []string{"mini unreachable (1 waiting outside triage)", "mini board stopped (1 waiting outside triage)", "mini back online"}; !slices.Equal(u.notices, want) {
+		t.Fatalf("notices = %q, want %q", u.notices, want)
 	}
 }
 
@@ -368,7 +431,7 @@ func TestScrollingAndOwnershipTransitions(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		m.decorate([]observation{obs}, local)
 	}
-	if u.ownCalls != 0 || u.badges["l1"] != "↕ scroll mode" || u.facts["l1"] != "mini · claude · working · scroll mode: press q inside the mirror to type again · gi_a1" {
+	if u.ownCalls != 0 || u.badges["l1"] != "↕ scroll mode" || u.facts["l1"] != "claude on mini · working · scroll mode: press q inside the mirror to type again" {
 		t.Fatal(u.ownCalls, u.badges, u.facts)
 	}
 	obs.Snapshot.BoardRunning = boolPtr(false)
