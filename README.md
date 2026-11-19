@@ -64,15 +64,16 @@ through the screen or CLI.
 - Use `ctrl+q` to leave the focused mirror or advance triage. `ctrl+\` returns to the list.
   If scrolling put the remote pane in tmux scroll mode, press `q` inside the mirror to leave it.
 - Press `N` on the list to start a remote agent. Choose a machine and press Enter to load its
-  CLI choices, then fill in the task and optional directory. With one machine, it is already
-  selected. The spawn uses the remote login shell so the agent inherits its environment.
-- Restarting your board leaves mirrors running. Use `v` to revive a dead mirror. On a mirror,
-  `x` opens the stock **Kill session** prompt. Confirming closes the local SSH pane and archives
-  its row. The remote agent keeps running. The row stays dismissed until you restore it or the
-  remote session ends. To restore it, open the archive from the `:` menu, press `u` on its row,
-  and confirm.
+  installed CLIs, then fill in the task and optional directory. With one machine, it is already
+  selected. The check and spawn use the remote login shell so both see the agent's environment.
+- Restarting your board leaves mirrors running. Use `v` to revive a dead mirror. Press `alt+x`
+  on a mirror, or choose **dismiss the selected remote mirror** from Quick Actions, to close
+  the local SSH pane and archive its row. The remote agent keeps running. The row stays dismissed
+  until you restore it or the remote session ends. To restore it, open the archive from the `:`
+  menu, press `u` on its row, and confirm.
 - Offline, stopped and paused machines keep their rows and last status. A badge and the
-  `machine` detail line explain the state. Removing a machine archives its mirrors.
+  `machine` details show the state and remote working directory. Removing a machine archives
+  its mirrors.
 - Sessions need a `gi_<id>` tmux session. A pane adopted in place does not have one. To relaunch
   it as a board session, use stock `a` on the remote board.
 

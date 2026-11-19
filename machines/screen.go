@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/usestring/gate-inbox/extension"
+	"github.com/usestring/gate-inbox/extension/textfmt"
 )
 
 // The extension's own screens.
@@ -117,7 +118,7 @@ func (v *machinesView) Render(width, height int) []extension.Line {
 		nameWidth = max(nameWidth, len(h.Name))
 	}
 	if len(machines) == 0 {
-		lines = append(lines, extension.Line{{Text: "No machines yet. Press a to add one by its SSH destination: a host from ~/.ssh/config, a hostname, or user@host."}})
+		lines = append(lines, wrapLines([]extension.Line{{{Text: "No machines yet. Press a and enter an SSH alias, hostname, or user@host."}}}, width)...)
 	}
 	for i, h := range machines {
 		status, tone := v.e.machineStatus(h)
@@ -134,9 +135,9 @@ func (v *machinesView) Render(width, height int) []extension.Line {
 	lines = append(lines, extension.Line{}, extension.Line{{Text: "Suggestions", Bold: true}})
 	switch {
 	case v.loading:
-		lines = append(lines, extension.Line{{Text: "  looking in ~/.ssh/config and the discover command..."}})
+		lines = append(lines, wrapLines([]extension.Line{{{Text: "  Looking in ~/.ssh/config and the discover command..."}}}, width)...)
 	case len(v.suggestions) == 0:
-		lines = append(lines, extension.Line{{Text: "  None yet. Hosts in ~/.ssh/config show here, and so does what the discover setting's command prints."}})
+		lines = append(lines, wrapLines([]extension.Line{{{Text: "  None yet. Add an alias to ~/.ssh/config or set discover."}}}, width)...)
 	}
 	for i, s := range v.suggestions {
 		index := len(machines) + i
@@ -184,19 +185,9 @@ func wrapLines(lines []extension.Line, width int) []extension.Line {
 			continue
 		}
 		span := line[0]
-		rest := []rune(span.Text)
-		for len(rest) > width {
-			cut := width
-			for i := width; i > width/2; i-- {
-				if rest[i] == ' ' {
-					cut = i
-					break
-				}
-			}
-			out = append(out, extension.Line{{Text: string(rest[:cut]), Tone: span.Tone, Bold: span.Bold}})
-			rest = []rune(strings.TrimLeft(string(rest[cut:]), " "))
+		for _, part := range textfmt.Wrap(span.Text, width) {
+			out = append(out, extension.Line{{Text: part, Tone: span.Tone, Bold: span.Bold}})
 		}
-		out = append(out, extension.Line{{Text: string(rest), Tone: span.Tone, Bold: span.Bold}})
 	}
 	return out
 }
@@ -440,11 +431,11 @@ func (f *addForm) Title() string { return "Add a machine" }
 
 func (f *addForm) Fields() []extension.Field {
 	return []extension.Field{
-		{ID: "destination", Label: "Destination", Value: f.destination, Placeholder: "a host from ~/.ssh/config, a hostname, or user@host"},
+		{ID: "destination", Label: "Destination", Value: f.destination, Placeholder: "alias, host, or user@host"},
 		{ID: "name", Label: "Name", Placeholder: "from its hostname"},
-		{ID: "group", Label: "Group", Placeholder: "top level; an existing group on this board"},
-		{ID: "gate_inbox", Label: "Binary path", Placeholder: "Optional. Path to this build on the remote machine"},
-		{ID: "home", Label: "Board home", Placeholder: "Optional. GATE_INBOX_HOME on the remote machine"},
+		{ID: "group", Label: "Group", Placeholder: "top level"},
+		{ID: "gate_inbox", Label: "Binary path", Placeholder: "remote PATH"},
+		{ID: "home", Label: "Board home", Placeholder: "remote default"},
 	}
 }
 
@@ -452,7 +443,7 @@ func (f *addForm) Render(width, _ int) []extension.Line {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.lines) == 0 {
-		return wrapLines([]extension.Line{{{Text: "Only Destination is required. The board checks SSH when you submit. The remote machine needs this build and SSH key access."}}}, width)
+		return wrapLines([]extension.Line{{{Text: "Only Destination is required. The board checks SSH and the remote Gate Inbox build when you submit."}}}, width)
 	}
 	return wrapLines(f.lines, width)
 }

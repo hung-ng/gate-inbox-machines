@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,7 @@ func (e *Extension) machineUI() extension.UI {
 			}},
 		{Screen: spawnScreen, Action: extension.ActionClose, Keys: []string{"esc"}, Label: "close"},
 	}
+	keys = append(keys, dismissKeys(e)...)
 	return extension.UI{Keys: append(keys, machinesKeys()...)}
 }
 
@@ -70,41 +72,64 @@ func (e *Extension) openSpawn(ctx context.Context, machine string) {
 	for _, h := range e.machines().active() {
 		names = append(names, h.Name)
 	}
-	known := e.tools.copy()
-	f := &spawnForm{e: e, ctx: ctx, names: names, known: known}
+	f := &spawnForm{e: e, ctx: ctx, names: names}
 	if machine == "" && len(names) == 1 {
 		machine = names[0]
 	}
-	if machine != "" {
-		f.machine = machine
-		f.tools = known[machine]
+	f.mu.Lock()
+	if h, ok := e.machines().host(machine); ok && !h.Paused {
+		f.check(h)
 	}
-	e.ui.Open(spawnScreen, f)
+	f.handle = e.ui.Open(spawnScreen, f)
+	f.mu.Unlock()
 }
 
 type spawnForm struct {
-	e       *Extension
-	ctx     context.Context
-	names   []string
+	e      *Extension
+	ctx    context.Context
+	names  []string
+	handle extension.ViewHandle
+
+	mu      sync.Mutex
 	machine string
 	tools   []string
-	known   map[string][]string
+	loading bool
+	err     error
+	cancel  context.CancelFunc
 }
 
 func (f *spawnForm) Title() string { return "New session on another machine" }
-func (f *spawnForm) Render(int, int) []extension.Line {
-	if f.machine == "" {
-		return []extension.Line{{{Text: "Select a machine and press Enter to use its cached CLIs."}}}
+func (f *spawnForm) Render(width, _ int) []extension.Line {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var text string
+	switch {
+	case f.machine == "":
+		text = "Select a machine and press Enter to check its installed CLIs."
+	case f.loading:
+		text = "Checking installed CLIs on " + f.machine + "…"
+	case f.err != nil:
+		text = "Could not check installed CLIs. Enter a CLI name or choose another machine."
+	case len(f.tools) == 0:
+		text = "No agent CLI is installed on " + f.machine + ". Install one there and reopen this form."
+	default:
+		text = "Choose a CLI, enter a task and submit."
 	}
-	return []extension.Line{{{Text: "Choose a CLI, enter a task and submit."}}}
+	return wrapLines([]extension.Line{{{Text: text}}}, width)
 }
 func (f *spawnForm) Fields() []extension.Field {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	fields := []extension.Field{{ID: "machine", Label: "Machine", Choices: f.names, Value: f.machine}}
-	if f.machine == "" {
+	if f.machine == "" || (len(f.tools) == 0 && f.err == nil) {
 		return fields
 	}
+	choices := f.tools
+	if f.loading {
+		choices = nil
+	}
 	return append(fields,
-		extension.Field{ID: "cli", Label: "CLI", Choices: f.tools},
+		extension.Field{ID: "cli", Label: "CLI", Choices: choices, Placeholder: "CLI name"},
 		extension.Field{ID: "task", Label: "Task"},
 		extension.Field{ID: "directory", Label: "Directory", Placeholder: "that board's default"})
 }
@@ -112,20 +137,22 @@ func (f *spawnForm) Key(k extension.ViewKey) bool {
 	if k.Action != extension.ActionSubmit {
 		return false
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	name := k.Values["machine"]
 	h, ok := f.e.machines().host(name)
-	if !ok {
+	if !ok || h.Paused {
 		return false
 	}
 	if f.machine != name {
-		// The form API does not deliver picker changes. Submit commits the
-		// machine selection before exposing that machine's CLI choices.
-		f.machine = name
-		f.tools = f.known[name]
+		f.check(h)
+		return false
+	}
+	if f.loading || (len(f.tools) == 0 && f.err == nil) {
 		return false
 	}
 	cli, task, directory := k.Values["cli"], k.Values["task"], k.Values["directory"]
-	if strings.TrimSpace(cli) == "" {
+	if strings.TrimSpace(cli) == "" || (f.err == nil && !slices.Contains(f.tools, cli)) {
 		f.e.ui.Notify("Choose an agent CLI")
 		return false
 	}
@@ -146,29 +173,39 @@ func (f *spawnForm) Key(k extension.ViewKey) bool {
 	return true
 }
 
-// Polls and key handlers run concurrently. Copy slices so each open form
-// keeps its choices stable while later successful polls refresh the cache.
-type toolCache struct {
-	mu    sync.Mutex
-	known map[string][]string
+// check runs the probe in the same login shell as a spawn. A new machine
+// selection cancels the old probe so it cannot replace the current picker.
+func (f *spawnForm) check(h host) {
+	if f.cancel != nil {
+		f.cancel()
+	}
+	ctx, cancel := context.WithCancel(f.ctx)
+	f.cancel = cancel
+	f.machine, f.loading = h.Name, true
+	go func() {
+		probe, stop := context.WithTimeout(ctx, 15*time.Second)
+		defer stop()
+		tools, err := f.e.installedOnMachine(probe, h)
+		f.mu.Lock()
+		if ctx.Err() != nil {
+			f.mu.Unlock()
+			return
+		}
+		f.tools, f.err, f.loading = tools, err, false
+		handle := f.handle
+		f.mu.Unlock()
+		if handle != nil {
+			handle.Refresh()
+		}
+	}()
 }
 
-func (c *toolCache) set(name string, tools []string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.known == nil {
-		c.known = map[string][]string{}
+func (f *spawnForm) Closed(extension.CloseReason) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancel != nil {
+		f.cancel()
 	}
-	c.known[name] = append([]string(nil), tools...)
-}
-func (c *toolCache) copy() map[string][]string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	result := map[string][]string{}
-	for name, tools := range c.known {
-		result[name] = append([]string(nil), tools...)
-	}
-	return result
 }
 
 // Login files sometimes print a greeting. Accept a JSON reply after it,

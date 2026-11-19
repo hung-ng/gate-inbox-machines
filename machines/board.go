@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/usestring/gate-inbox/extension"
 )
 
@@ -111,13 +112,13 @@ type mirrors struct {
 	pinned     map[string]string
 	failed     map[string]time.Time
 	badges     map[string]string
+	dirs       map[string]string
 	lastErr    map[string]string
 	skipped    map[string]int
 	wake       <-chan string
 	since      map[string]time.Time
 	stopped    map[string]bool
 	owned      map[string]bool
-	tools      *toolCache
 	// reg is where the machines come from, read again every pass so one
 	// added or paused from a shell shows up without a restart.
 	reg *registry
@@ -140,6 +141,7 @@ func newMirrors(cfg config, board boardOps, ui extension.UIHost, log *slog.Logge
 		pinned:  map[string]string{},
 		failed:  map[string]time.Time{},
 		badges:  map[string]string{},
+		dirs:    map[string]string{},
 		lastErr: map[string]string{},
 		skipped: map[string]int{},
 		since:   map[string]time.Time{},
@@ -252,6 +254,7 @@ func (m *mirrors) forget(id string) {
 	}
 	delete(m.pinned, id)
 	delete(m.badges, id)
+	delete(m.dirs, id)
 	delete(m.owned, id)
 }
 
@@ -284,9 +287,6 @@ func (m *mirrors) observe(ctx context.Context, hosts []host) []observation {
 			}
 		} else {
 			delete(m.since, name)
-			if m.tools != nil {
-				m.tools.set(name, obs.Snapshot.Tools)
-			}
 			stopped := !obs.Snapshot.boardRunning()
 			if stopped != m.stopped[name] {
 				m.log.Info("machine board running changed", "machine", name, "board_running", !stopped)
@@ -449,17 +449,13 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 		return
 	}
 	reachable := map[string]bool{}
-	status := map[string]string{}
-	tools := map[string]string{}
-	scrolling := map[string]bool{}
+	sessions := map[string]machineSession{}
 	stopped := map[string]bool{}
 	for _, obs := range observed {
 		reachable[obs.Host.Name] = obs.Err == nil
 		stopped[obs.Host.Name] = !obs.Snapshot.boardRunning()
 		for _, s := range obs.Snapshot.Sessions {
-			status[mirrorKey(obs.Host.Name, s.ID)] = s.Status
-			scrolling[mirrorKey(obs.Host.Name, s.ID)] = s.Scrolling
-			tools[mirrorKey(obs.Host.Name, s.ID)] = s.Tool
+			sessions[mirrorKey(obs.Host.Name, s.ID)] = s
 		}
 	}
 	for _, key := range sortedKeys(m.state.Mirrors) {
@@ -472,7 +468,11 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 			m.ui.Own(id, owned)
 		}
 		m.owned[id] = owned
-		fact := hostName + " · " + tools[key] + " · " + status[key] + " · gi_" + sessionID
+		session := sessions[key]
+		if session.Directory != "" {
+			m.dirs[id] = session.Directory
+		}
+		fact := hostName + " · " + session.Tool + " · " + session.Status + " · gi_" + sessionID
 		switch {
 		case machine.Paused:
 			badge = extension.Badge{Text: "Ⅱ " + hostName + " paused", Short: "Ⅱ", Tone: extension.ToneWarn}
@@ -483,12 +483,21 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 		case stopped[hostName]:
 			badge = extension.Badge{Text: "✕ " + hostName + " board stopped", Short: "✕", Tone: extension.ToneBad}
 			fact = hostName + " · no status until you start that machine's board · gi_" + sessionID
-		case scrolling[key]:
+		case session.Scrolling:
 			badge = extension.Badge{Text: "↕ scroll mode", Short: "↕", Tone: extension.ToneWarn}
-			fact = hostName + " · " + tools[key] + " · " + status[key] + " · scroll mode: press q inside the mirror to type again · gi_" + sessionID
+			fact = hostName + " · " + session.Tool + " · " + session.Status + " · scroll mode: press q inside the mirror to type again · gi_" + sessionID
 		case local[id].ID != "" && !local[id].Running:
 			badge = extension.Badge{Text: "⇄ " + hostName + " detached", Short: "⇄ ·", Tone: extension.ToneWarn}
-		case status[key] == "waiting":
+		}
+		if dir := m.dirs[id]; dir != "" {
+			// The stock sidebar hides the entire detail block if it takes
+			// too many rows. Keep the end of long paths visible there.
+			const pathWidth = 21
+			if excess := ansi.StringWidth(dir) - pathWidth; excess > 0 {
+				dir = ansi.TruncateLeft(dir, excess+1, "…")
+			}
+			fact += " · Remote dir: " + dir
+		} else if !owned && badge.Text == "" && session.Status == "waiting" {
 			fact += " · Press Enter to read and answer on the remote machine"
 		}
 		if m.badges[id] == badge.Text+fact {

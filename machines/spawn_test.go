@@ -3,13 +3,15 @@ package machines
 import (
 	"context"
 	"errors"
-	"github.com/usestring/gate-inbox/extension"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/usestring/gate-inbox/extension"
 )
 
 type toolsHost struct {
@@ -32,6 +34,23 @@ func TestAvailableToolsIncludesCommandsOutsidePATH(t *testing.T) {
 	}
 }
 
+func TestInstalledToolsChecksConfiguredCommands(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "custom-agent")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	config := fmt.Sprintf("[tools.agent]\ncommand = %q\n", binary+" --example")
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	tools, err := installedTools(context.Background(), toolsHost{dir: dir})
+	if err != nil || strings.Join(tools, ",") != "agent" {
+		t.Fatal(tools, err)
+	}
+}
+
 func TestSpawnArgvAndForm(t *testing.T) {
 	cfg := testConfig()
 	cfg.ControlPath = "none"
@@ -49,18 +68,28 @@ func TestSpawnArgvAndForm(t *testing.T) {
 	}
 	e := New()
 	e.reg = newRegistry(machineStore(t, t.TempDir(), mini, box))
-	f := &spawnForm{e: e, names: []string{"mini", "box"}, known: map[string][]string{"mini": {"agent"}}}
+	e.run = func(_ context.Context, args []string) ([]byte, error) {
+		if args[len(args)-2] == "mini" {
+			return []byte("hello from zsh\n[\"agent\"]\n"), nil
+		}
+		return nil, errors.New("older remote helper has no tools command")
+	}
+	f := &spawnForm{e: e, ctx: context.Background(), names: []string{"mini", "box"}}
 	if len(f.Fields()) != 1 {
 		t.Fatal(f.Fields())
 	}
 	if f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: map[string]string{"machine": "mini"}}) {
 		t.Fatal("submitted machine choice")
 	}
+	waitFor(t, "installed tools", func() bool { return len(f.Fields()) == 4 })
 	fields := f.Fields()
 	if len(fields) != 4 || len(fields[1].Choices) != 1 || fields[3].Placeholder != "that board's default" {
 		t.Fatal(fields)
 	}
 	f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: map[string]string{"machine": "box"}})
+	waitFor(t, "older helper fallback", func() bool {
+		return strings.Contains(text(f.Render(80, 10)), "Could not check installed CLIs")
+	})
 	if len(f.Fields()[1].Choices) != 0 {
 		t.Fatal("unknown tools must allow typing")
 	}
@@ -92,13 +121,12 @@ func TestFormOpensSpawnsNotifiesAndWakesPoll(t *testing.T) {
 		e.reg = newRegistry(machineStore(t, t.TempDir(), mini))
 		u := &spawnUI{notifications: make(chan string, 1)}
 		e.ui = u
-		e.tools.set("mini", []string{"agent"})
 		calls := make(chan []string, 2)
 		e.run = func(_ context.Context, a []string) ([]byte, error) {
-			calls <- a
-			if strings.Contains(a[len(a)-1], "machines sessions") {
-				return []byte(`{"version":1,"board_running":true,"tools":["agent"],"sessions":[]}`), nil
+			if strings.Contains(a[len(a)-1], "machines tools --json") {
+				return []byte(`["agent"]`), nil
 			}
+			calls <- a
 			if fail {
 				return nil, errors.New("CLI agent is not installed")
 			}
@@ -111,6 +139,7 @@ func TestFormOpensSpawnsNotifiesAndWakesPoll(t *testing.T) {
 			t.Fatal(u.screen)
 		}
 		f := u.opened.(*spawnForm)
+		waitFor(t, "installed tools", func() bool { return len(f.Fields()) == 4 })
 		select {
 		case <-calls:
 			t.Fatal("opening form ran ssh")
@@ -150,22 +179,24 @@ func TestFormOpensSpawnsNotifiesAndWakesPoll(t *testing.T) {
 	}
 }
 
-func TestCachedToolsSurviveFailureAndAreCopied(t *testing.T) {
+func TestSpawnFormShowsWhenMachineHasNoInstalledTools(t *testing.T) {
 	e := New()
-	e.cfg = config{Poll: defaultPoll, SSH: []string{"ssh"}}
-	replies := hosts{"mini": snapshot{Version: wireVersion, Tools: []string{"agent"}, Sessions: []machineSession{}}}
-	m := newMirrors(e.cfg, newFakeBoard(), nil, quiet(), replies.run, machineStore(t, t.TempDir(), mini))
-	m.tools = &e.tools
-	m.observe(context.Background(), m.reg.active())
-	replies["mini"] = context.DeadlineExceeded
-	m.observe(context.Background(), m.reg.active())
-	copy := e.tools.copy()
-	if strings.Join(copy["mini"], ",") != "agent" {
-		t.Fatal(copy)
+	e.reg = newRegistry(machineStore(t, t.TempDir(), mini))
+	u := &spawnUI{notifications: make(chan string, 1)}
+	e.ui = u
+	e.run = func(_ context.Context, args []string) ([]byte, error) {
+		if !strings.Contains(args[len(args)-1], "machines tools --json") {
+			t.Errorf("unexpected command: %v", args)
+		}
+		return []byte("[]\n"), nil
 	}
-	copy["mini"][0] = "changed"
-	if e.tools.copy()["mini"][0] != "agent" {
-		t.Fatal("shared slice")
+	e.openSpawn(context.Background(), "mini")
+	f := u.opened.(*spawnForm)
+	waitFor(t, "the empty picker", func() bool {
+		return strings.Contains(text(f.Render(80, 10)), "No agent CLI is installed")
+	})
+	if len(f.Fields()) != 1 || f.Key(extension.ViewKey{Action: extension.ActionSubmit, Values: map[string]string{"machine": "mini", "cli": "claude"}}) {
+		t.Fatal("an empty picker allowed a spawn")
 	}
 }
 

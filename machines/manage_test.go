@@ -775,6 +775,21 @@ func TestWrapLinesBreaksLongNotesAtSpaces(t *testing.T) {
 	}
 }
 
+func TestEmptyMachineHintsWrapAtNarrowWidth(t *testing.T) {
+	e := newManaged(t, healthyFar())
+	v := &machinesView{e: e}
+	lines := v.Render(44, 12)
+	for _, line := range lines {
+		if line.Width() > 44 {
+			t.Fatalf("line exceeds card width: %v", line)
+		}
+	}
+	body := text(lines)
+	if !strings.Contains(body, "user@host") || !strings.Contains(body, "discover.") {
+		t.Fatal(body)
+	}
+}
+
 func TestTmuxToUseFallsBackFromAMissingPath(t *testing.T) {
 	for in, want := range map[string]string{"/no/such/tmux": "tmux", "/bin/sh": "/bin/sh", "tmux": "tmux", "~/bin/tmux": "~/bin/tmux"} {
 		if got := tmuxToUse(in); got != want {

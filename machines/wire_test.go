@@ -43,7 +43,7 @@ func TestListSessionsReadsEveryPageAndLeavesOutMirrors(t *testing.T) {
 		},
 		{
 			{ID: "c3", Name: "mirror of laptop", Tool: "machines", Role: mirrorRole, Running: true},
-			{ID: "d4", Name: "docs", Tool: "codex", Group: "web", Status: "waiting", Running: true, ParentID: "a1"},
+			{ID: "d4", Name: "docs", Tool: "codex", Group: "web", Directory: "/home/user/docs project", Status: "waiting", Running: true, ParentID: "a1"},
 			{ID: "e5", Name: "machines-e5", Tool: "machines", Running: true},
 		},
 	}}
@@ -63,6 +63,9 @@ func TestListSessionsReadsEveryPageAndLeavesOutMirrors(t *testing.T) {
 	}
 	if !snap.Sessions[0].Attachable || snap.Sessions[1].Attachable {
 		t.Errorf("attachable = %v, %v; want only a1, which has a gi_ session", snap.Sessions[0].Attachable, snap.Sessions[1].Attachable)
+	}
+	if snap.Sessions[1].Directory != "/home/user/docs project" {
+		t.Fatal(snap.Sessions[1])
 	}
 	// What one end prints, the other end reads.
 	var buf bytes.Buffer

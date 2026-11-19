@@ -67,7 +67,6 @@ type Extension struct {
 	run     runner
 	attach  attachRunner
 	wake    chan string
-	tools   toolCache
 	status  statusBoard
 }
 
@@ -156,7 +155,6 @@ func (e *Extension) StartBoard(ctx context.Context, board extension.BoardHost) (
 	m := newMirrors(e.cfg, board, e.ui, board.Logger(), e.run, dataDir)
 	m.reg = e.machines()
 	m.wake = e.wake
-	m.tools = &e.tools
 	m.status = &e.status
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -171,6 +169,7 @@ const (
 	usageSessions = "machines sessions [--tmux <path>] [--tmux-socket <name>] [--json]"
 	usageAttach   = "machines attach [<machine> <session-id>]"
 	usageCheck    = "machines check [<machine>...]"
+	usageTools    = "machines tools [--json]"
 
 	usageAdd    = "machines add [--name <name>] [--group <group>] [--home <dir>] [--gate-inbox <path>] [--force] <destination>"
 	usageRemove = "machines remove <machine>"
@@ -183,7 +182,7 @@ const (
 func (e *Extension) Commands() []extension.Command {
 	return []extension.Command{{
 		Name:  "machines",
-		Usage: "machines <add|list|remove|pause|resume|check|sessions|attach>",
+		Usage: "machines <add|list|remove|pause|resume|check|sessions|tools|attach>",
 		About: "add and manage the other machines whose agents this board shows, and answer their boards",
 		Run:   e.runMachines,
 	}}
@@ -203,6 +202,11 @@ func (e *Extension) runMachines(ctx context.Context, args []string, host extensi
 			Name: "sessions", Usage: usageSessions,
 			About: "list this board's agent sessions, for your other machines' boards to show",
 			Run:   func(args []string) error { return e.runSessions(ctx, args, host) },
+		},
+		{
+			Name: "tools", Usage: usageTools,
+			About: "list the installed agent CLIs on this machine",
+			Run:   func(args []string) error { return runTools(ctx, args, host) },
 		},
 		{
 			Name: "attach", Usage: usageAttach,

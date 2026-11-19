@@ -198,7 +198,9 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	if err := json.Unmarshal(data, &saved); err != nil || saved.Mirrors["mini/a1"] != "l1" {
 		t.Fatalf("saved %s (%v)", data, err)
 	}
-	reply["mini"] = snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{live("a1", "working")}}
+	working := live("a1", "working")
+	working.Directory = "/srv/remote project"
+	reply["mini"] = snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{working}}
 	m = newMirrors(cfg, board, ui, quiet(), reply.run, dir)
 	m.pass(context.Background())
 	if len(board.launches) != 1 {
@@ -207,7 +209,7 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	if got := board.sessions["l1"]; got.Status != "working" || !got.Running || len(board.archives) != 0 || m.state.Mirrors["mini/a1"] != "l1" {
 		t.Fatalf("restart changed the mirror: row %+v, archives %v, state %v", got, board.archives, m.state)
 	}
-	if got := ui.facts["l1"]; got != "mini · claude · working · gi_a1" {
+	if got := ui.facts["l1"]; got != "mini · claude · working · gi_a1 · Remote dir: /srv/remote project" {
 		t.Errorf("working mirror detail = %q", got)
 	}
 	m.pass(context.Background())
@@ -225,12 +227,28 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	if ui.badges["l1"] != "✕ mini offline" {
 		t.Errorf("badge = %q", ui.badges["l1"])
 	}
+	if !strings.Contains(ui.facts["l1"], "Remote dir: /srv/remote project") {
+		t.Fatal("offline mirror lost its remote directory")
+	}
 
 	// It comes back without the session: the mirror goes.
 	reply["mini"] = snapshot{BoardRunning: boolPtr(true), Version: wireVersion, Sessions: []machineSession{}}
 	m.pass(context.Background())
 	if strings.Join(board.archives, ",") != "l1" {
 		t.Errorf("archives = %v", board.archives)
+	}
+}
+
+func TestWaitingMirrorKeepsLongDirectoryFactBrief(t *testing.T) {
+	session := live("a1", "waiting")
+	session.Directory = "/home/agent/projects/code/alpha-build-directory"
+	reply := hosts{"mini": snapshot{Version: wireVersion, Sessions: []machineSession{session}}}
+	ui := &fakeUI{badges: map[string]string{}, facts: map[string]string{}}
+	m := newMirrors(testConfig(), newFakeBoard(), ui, quiet(), reply.run, machineStore(t, t.TempDir(), mini))
+	m.pass(context.Background())
+	want := "mini · claude · waiting · gi_a1 · Remote dir: …lpha-build-directory"
+	if got := ui.facts["l1"]; got != want {
+		t.Errorf("waiting mirror detail = %q, want %q", got, want)
 	}
 }
 

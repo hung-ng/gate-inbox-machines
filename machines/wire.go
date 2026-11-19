@@ -40,6 +40,7 @@ type machineSession struct {
 	Name      string `json:"name"`
 	Tool      string `json:"tool"`
 	Group     string `json:"group,omitempty"`
+	Directory string `json:"directory,omitempty"`
 	Status    string `json:"status"`
 	Running   bool   `json:"running"`
 	Scrolling bool   `json:"scrolling,omitempty"`
@@ -84,7 +85,7 @@ func listSessions(ctx context.Context, sessions extension.SessionService, attach
 			continue
 		}
 		snap.Sessions = append(snap.Sessions, machineSession{
-			ID: s.ID, Name: s.Name, Tool: s.Tool, Group: s.Group,
+			ID: s.ID, Name: s.Name, Tool: s.Tool, Group: s.Group, Directory: s.Directory,
 			Status: s.Status, Running: s.Running, ParentID: s.ParentID,
 			Attachable: attachable[s.ID],
 		})
