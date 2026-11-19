@@ -25,12 +25,16 @@ gate-inbox machines add user@host
 gate-inbox machines check
 ```
 
+The Gate Inbox key map (`h`) and Quick Actions (`:`) list **add and manage your other
+machines** (`O`) and **new session on another machine** (`N`).
+
 Use an SSH alias, hostname, or `user@host`. If an SSH check fails, run the command it shows
 in a terminal, then retry. Press `T` on the board to open a terminal.
 
-The add form and CLI accept a name, an existing group, the remote board's `GATE_INBOX_HOME`
-if custom, and the remote path to this build if its PATH finds another binary. Use `g` on the
-main list to make a group. Run `gate-inbox machines add --help` for CLI options.
+Only the SSH destination is required. You can give the machine a name or put its rows in an
+existing local group. Use `g` on the main list to make a group. Set **Board home** if the
+remote board uses a custom `GATE_INBOX_HOME`. Set **Binary path** if SSH finds a different
+`gate-inbox` first. Run `gate-inbox machines add --help` for CLI options.
 
 On the machines screen:
 
@@ -54,18 +58,19 @@ through the screen or CLI.
 
 ## Use mirrors
 
-- Press Enter on a mirror to see and answer a dialog in the remote terminal. In stock v1.1.0,
-  the mirror list preview showed neither conversation text nor a dialog card. Snippet keys and
-  `r` type straight into the remote pane and can answer a dialog. Avoid them on mirrors.
+- Press Enter on a waiting mirror to read the question and answer in the remote terminal.
+  Snippet keys and `r` can type into the pane while a dialog is out of view, so open the
+  terminal to respond.
 - Use `ctrl+q` to leave the focused mirror or advance triage. `ctrl+\` returns to the list.
   If scrolling put the remote pane in tmux scroll mode, press `q` inside the mirror to leave it.
 - Press `N` on the list to start a remote agent. Choose a machine and press Enter to load its
   CLI choices, then fill in the task and optional directory. With one machine, it is already
   selected. The spawn uses the remote login shell so the agent inherits its environment.
-- Restarting your board leaves mirrors running. After killing a mirror, use stock `v` to revive
-  the same row. To bring an archived mirror back, open the archive from the `:` menu and press
-  `u` on its row. Archiving a mirror leaves the remote agent running. It stays dismissed until
-  you restore it or the remote session stops running.
+- Restarting your board leaves mirrors running. Use `v` to revive a dead mirror. On a mirror,
+  `x` opens the stock **Kill session** prompt. Confirming closes the local SSH pane and archives
+  its row. The remote agent keeps running. The row stays dismissed until you restore it or the
+  remote session ends. To restore it, open the archive from the `:` menu, press `u` on its row,
+  and confirm.
 - Offline, stopped and paused machines keep their rows and last status. A badge and the
   `machine` detail line explain the state. Removing a machine archives its mirrors.
 - Sessions need a `gi_<id>` tmux session. A pane adopted in place does not have one. To relaunch

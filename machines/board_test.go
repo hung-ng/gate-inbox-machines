@@ -185,7 +185,7 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	if strings.Join(board.pins, ",") != "l1=waiting" {
 		t.Errorf("pins = %v", board.pins)
 	}
-	if ui.badges["l1"] != "" || ui.facts["l1"] != "mini · claude · waiting · gi_a1" {
+	if ui.badges["l1"] != "" || ui.facts["l1"] != "mini · claude · waiting · gi_a1 · Press Enter to read and answer on the remote machine" {
 		t.Errorf("badge %q fact %q", ui.badges["l1"], ui.facts["l1"])
 	}
 
@@ -206,6 +206,9 @@ func TestPassMirrorsAHostsSessionsAndFollowsThem(t *testing.T) {
 	}
 	if got := board.sessions["l1"]; got.Status != "working" || !got.Running || len(board.archives) != 0 || m.state.Mirrors["mini/a1"] != "l1" {
 		t.Fatalf("restart changed the mirror: row %+v, archives %v, state %v", got, board.archives, m.state)
+	}
+	if got := ui.facts["l1"]; got != "mini · claude · working · gi_a1" {
+		t.Errorf("working mirror detail = %q", got)
 	}
 	m.pass(context.Background())
 	if got := strings.Join(board.pins, ","); got != "l1=waiting,l1=working" {

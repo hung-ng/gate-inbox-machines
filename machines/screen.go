@@ -443,8 +443,8 @@ func (f *addForm) Fields() []extension.Field {
 		{ID: "destination", Label: "Destination", Value: f.destination, Placeholder: "a host from ~/.ssh/config, a hostname, or user@host"},
 		{ID: "name", Label: "Name", Placeholder: "from its hostname"},
 		{ID: "group", Label: "Group", Placeholder: "top level; an existing group on this board"},
-		{ID: "gate_inbox", Label: "gate-inbox path", Placeholder: "found on its PATH or through its login shell"},
-		{ID: "home", Label: "Board home", Placeholder: "its default; GATE_INBOX_HOME if its board uses one"},
+		{ID: "gate_inbox", Label: "Binary path", Placeholder: "Optional. Path to this build on the remote machine"},
+		{ID: "home", Label: "Board home", Placeholder: "Optional. GATE_INBOX_HOME on the remote machine"},
 	}
 }
 
@@ -452,7 +452,7 @@ func (f *addForm) Render(width, _ int) []extension.Line {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.lines) == 0 {
-		return wrapLines([]extension.Line{{{Text: "The board checks the machine over ssh, then adds it. It needs this build installed there, and a key login that works without a prompt."}}}, width)
+		return wrapLines([]extension.Line{{{Text: "Only Destination is required. The board checks SSH when you submit. The remote machine needs this build and SSH key access."}}}, width)
 	}
 	return wrapLines(f.lines, width)
 }

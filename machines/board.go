@@ -488,6 +488,8 @@ func (m *mirrors) decorate(observed []observation, local map[string]extension.Se
 			fact = hostName + " · " + tools[key] + " · " + status[key] + " · scroll mode: press q inside the mirror to type again · gi_" + sessionID
 		case local[id].ID != "" && !local[id].Running:
 			badge = extension.Badge{Text: "⇄ " + hostName + " detached", Short: "⇄ ·", Tone: extension.ToneWarn}
+		case status[key] == "waiting":
+			fact += " · Press Enter to read and answer on the remote machine"
 		}
 		if m.badges[id] == badge.Text+fact {
 			continue
