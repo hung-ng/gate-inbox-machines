@@ -6,9 +6,9 @@ This is a prototype of multi-machine support. It builds on stock Gate Inbox v1.1
 
 ## Screenshots
 
-![Triage jumps to a waiting Claude session on another machine](docs/screenshots/triage.gif)
+![Adding a machine, starting a session on another machine, and opening its mirror](docs/screenshots/tour.gif)
 
-Claude on `mini` reaches an edit-permission prompt and its mirror row turns `waiting`. Stock triage (`i`) jumps to it, the operator approves the edit in the remote terminal, and `ctrl+q` returns to the board.
+`O` then `a` adds `devbox`, the check runs step by step, and its sessions appear as mirrors in their own group. `N` picks `mini`, loads the CLIs installed there and starts Claude, and the new row shows the worker's CPU, RAM and directory. Enter opens the agent's terminal on `mini`.
 
 ![Gate Inbox list with local and remote sessions](docs/screenshots/board.png)
 
