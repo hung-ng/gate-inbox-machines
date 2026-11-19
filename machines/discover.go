@@ -257,8 +257,8 @@ func (e *Extension) sshTarget(ctx context.Context, destination string) (string, 
 
 // shortHostname is a hostname compared without case, a trailing dot or a
 // ".local" suffix, which is how one machine's own name and its local
-// network name match: "hung-mini", "Hung-Mini.local" and
-// "hung-mini.local." are one name.
+// network name match: "dev-mini", "Dev-Mini.local" and
+// "dev-mini.local." are one name.
 func shortHostname(name string) string {
 	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
 	return strings.TrimSuffix(name, ".local")

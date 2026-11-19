@@ -64,7 +64,7 @@ func TestShellWordRoundTripsThroughLoginShells(t *testing.T) {
 }
 
 func testConfig() config {
-	return config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "/tmp/gir-test/%C"}
+	return config{Poll: defaultPoll, SSH: []string{"ssh"}, ControlPath: "/tmp/machines-test/%C"}
 }
 
 func TestListArgv(t *testing.T) {
@@ -73,7 +73,7 @@ func TestListArgv(t *testing.T) {
 	want := []string{
 		"ssh",
 		"-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-		"-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/gir-test/%C", "-o", "ControlPersist=10m",
+		"-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/machines-test/%C", "-o", "ControlPersist=10m",
 		"--", "me@mini", `exec env PATH="$HOME"/go/bin:"$PATH":"$HOME"/go/bin:"$HOME"/.local/bin:/opt/homebrew/bin:/usr/local/bin "$HOME"/go/bin/gate-inbox machines sessions --json --tmux tmux`,
 	}
 	if !slices.Equal(got, want) {
@@ -93,9 +93,9 @@ func TestListArgvWithHome(t *testing.T) {
 // named in full gets that directory on PATH: a non-interactive ssh on a
 // Mac has no /opt/homebrew/bin.
 func TestListArgvPutsTmuxOnPath(t *testing.T) {
-	h := host{Name: "mini", Destination: "mini", GateInbox: "/Users/me/go/bin/gate-inbox", Tmux: "/opt/homebrew/bin/tmux", TmuxSocket: "agents"}
+	h := host{Name: "mini", Destination: "mini", GateInbox: "/opt/gate-inbox/bin/gate-inbox", Tmux: "/opt/homebrew/bin/tmux", TmuxSocket: "agents"}
 	got := listArgv(testConfig(), h)
-	want := `exec env PATH=/opt/homebrew/bin:/Users/me/go/bin:"$PATH":"$HOME"/go/bin:"$HOME"/.local/bin:/opt/homebrew/bin:/usr/local/bin GATE_INBOX_TMUX_SOCKET=agents /Users/me/go/bin/gate-inbox machines sessions --json --tmux /opt/homebrew/bin/tmux --tmux-socket agents`
+	want := `exec env PATH=/opt/homebrew/bin:/opt/gate-inbox/bin:"$PATH":"$HOME"/go/bin:"$HOME"/.local/bin:/opt/homebrew/bin:/usr/local/bin GATE_INBOX_TMUX_SOCKET=agents /opt/gate-inbox/bin/gate-inbox machines sessions --json --tmux /opt/homebrew/bin/tmux --tmux-socket agents`
 	if last := got[len(got)-1]; last != want {
 		t.Errorf("command on the machine = %s\nwant                    %s", last, want)
 	}

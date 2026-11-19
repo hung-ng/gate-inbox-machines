@@ -9,7 +9,6 @@ import (
 // machineState is one machine as the last pass found it, for the machines
 // screen.
 type machineState struct {
-	At time.Time
 	// Err is why the machine could not be read, and Since when that
 	// started.
 	Err          string
@@ -105,7 +104,7 @@ func (m *mirrors) publish(observed []observation) {
 	states := map[string]machineState{}
 	for _, obs := range observed {
 		name := obs.Host.Name
-		st := machineState{At: m.now()}
+		var st machineState
 		if obs.Err != nil {
 			st.Err = obs.Err.Error()
 			st.Since = m.since[name]

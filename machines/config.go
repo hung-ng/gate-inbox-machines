@@ -60,8 +60,7 @@ type host struct {
 	Tmux        string
 	TmuxSocket  string
 	Group       string
-	// Paused is a machine the operator paused: it is not polled, and its
-	// mirrors are put away until it is resumed.
+	// Paused stops polling and keeps the machine's mirrors outside triage.
 	Paused bool
 	// Settings is what the operator wrote. A key set there wins over what
 	// the machine reports about itself.

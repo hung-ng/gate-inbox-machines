@@ -1,7 +1,6 @@
-// Command gate-inbox is Gate Inbox built with the machines extension: the
-// board's own app package, plus the sessions of the hosts named under
-// [extensions.machines.<name>]. Run the same build on every machine; a host's
-// board is read through this build's `machines sessions`.
+// Command gate-inbox builds Gate Inbox with the machines extension.
+// Controllers use it to run the board. Workers can run a stock board and
+// use this build to answer SSH requests for session data.
 package main
 
 import (

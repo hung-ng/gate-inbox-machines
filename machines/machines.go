@@ -1,17 +1,7 @@
-// Package machines is a Gate Inbox extension that puts the agent sessions
-// running on your other machines on this board, beside its own.
-//
-// Each machine runs its own board, as it does today: that board reads its
-// panes, holds its questions and types its messages. This extension asks
-// each added machine's board for its sessions over ssh, and gives
-// every one a row here: a session of the extension's own whose pane runs
-// `ssh -t <machine> tmux attach -t gi_<id>`, with its status pinned to the
-// one that machine's board reports. The row sorts into triage, and
-// focusing it opens the remote terminal.
-//
-// Nothing listens on a port. Everything goes over ssh with the operator's
-// own key, so this extension can reach on a machine exactly what the
-// operator could reach by ssh-ing in.
+// Package machines mirrors agent sessions from other machines on a Gate
+// Inbox board. Each worker tracks its sessions locally. The controller
+// polls workers over SSH and opens each mirror in a local pane that
+// attaches to the worker's tmux session.
 package machines
 
 import (
@@ -37,8 +27,7 @@ const (
 	program = "gate-inbox"
 )
 
-// ConfigDefaults is the tool block a build carrying this extension lays
-// under the operator's config (app.Options.ConfigDefaults).
+// ConfigDefaults defines the mirror tool for app.Options.ConfigDefaults.
 //
 // The pane runs this build's own `machines attach`, which holds the ssh
 // connection and reconnects it. It is reached through GATE_INBOX_BIN, which
@@ -48,7 +37,7 @@ const (
 // other machine, past that machine's board's own checks. skip_rename_directive keeps the
 // board's naming request out of the pane for the same reason, and mcp
 // "none" keeps it from registering an MCP server for a process that is
-// only ssh.
+// only an SSH client.
 const ConfigDefaults = `[tools.mirror]
 command = "sh -c 'exec \"${GATE_INBOX_BIN:-gate-inbox}\" machines attach \"$@\"' --"
 default_status = "idle"
@@ -56,7 +45,7 @@ mcp = "none"
 skip_rename_directive = true
 `
 
-// Extension is the machines extension. The zero value is not ready; use New.
+// Extension is the machines extension. Construct one with New.
 type Extension struct {
 	cfg     config
 	conf    extension.Config
@@ -75,6 +64,7 @@ func New() *Extension {
 	return &Extension{run: execRunner, attach: execAttach, wake: make(chan string, 1)}
 }
 
+// Descriptor identifies the extension and its version to Gate Inbox.
 func (e *Extension) Descriptor() extension.Descriptor {
 	return extension.Descriptor{ID: extensionID, Version: Version}
 }
@@ -133,6 +123,7 @@ func (e *Extension) Roles() []extension.RoleSpec {
 	}}
 }
 
+// UI registers the machines screens and key bindings.
 func (e *Extension) UI(host extension.UIHost) (extension.UI, error) {
 	e.ui = host
 	return e.machineUI(), nil
@@ -179,6 +170,7 @@ const (
 	usageList   = "machines list [--json]"
 )
 
+// Commands registers the machines CLI command and its subcommands.
 func (e *Extension) Commands() []extension.Command {
 	return []extension.Command{{
 		Name:  "machines",

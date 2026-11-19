@@ -134,7 +134,7 @@ func TestMachineReportsTmuxAndOperatorSetsGateInbox(t *testing.T) {
 func TestSuggestName(t *testing.T) {
 	none := func(string) bool { return false }
 	for _, tc := range []struct{ hostname, destination, want string }{
-		{"hung-mini", "x", "hung-mini"},
+		{"dev-mini", "x", "dev-mini"},
 		{"Box-1.local", "", "box-1"},
 		{"", "me@Box.Example.com", "box"},
 		{"", "10.0.0.7", "m-10"},
@@ -520,8 +520,8 @@ Include ~/.ssh/config
 }
 
 func TestDiscoverCommand(t *testing.T) {
-	got, err := discoverCommand(context.Background(), []string{"sh", "-c", `printf 'a.example.ts.net.\n# note\n\nb extra words\n-bad\na.example.ts.net\n'`})
-	if err != nil || strings.Join(got, ",") != "a.example.ts.net,b" {
+	got, err := discoverCommand(context.Background(), []string{"sh", "-c", `printf 'a.example.com.\n# note\n\nb extra words\n-bad\na.example.com\n'`})
+	if err != nil || strings.Join(got, ",") != "a.example.com,b" {
 		t.Fatal(got, err)
 	}
 	if _, err := discoverCommand(context.Background(), []string{"sh", "-c", "echo nope >&2; exit 3"}); err == nil || !strings.Contains(err.Error(), "nope") {
@@ -860,7 +860,7 @@ func TestSuggestionsLeaveOutMachinesAlreadyOnTheBoard(t *testing.T) {
 	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
 	os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte("Host mini-alias devbox\n"), 0o600)
 	far := healthyFar()
-	far.snap.About.Hostname = "hung-mini"
+	far.snap.About.Hostname = "dev-mini"
 	far.targets = map[string]string{
 		"mini.example.com": resolved("me", "mini.example.com", "22"),
 		"mini-alias":       resolved("me", "mini.example.com", "22"),
@@ -869,7 +869,7 @@ func TestSuggestionsLeaveOutMachinesAlreadyOnTheBoard(t *testing.T) {
 	}
 	mini := host{Name: "mini", Destination: "mini.example.com", GateInbox: "gate-inbox", Tmux: "tmux"}
 	e := newManaged(t, far, mini)
-	e.reg.learn("mini", "mini.example.com", about{Hostname: "hung-mini"})
+	e.reg.learn("mini", "mini.example.com", about{Hostname: "dev-mini"})
 	e.cfg.Discover = []string{"sh", "-c", "printf '10.0.0.7\\n'"}
 	found, problem := e.suggestions(context.Background())
 	want := []suggestion{{Destination: "10.0.0.7", From: fromDiscover}, {Destination: "devbox", From: fromSSHConfig}}
@@ -1080,15 +1080,15 @@ func TestSuggestionsLeaveOutALocalNameForAMachineOnTheBoard(t *testing.T) {
 	far := healthyFar()
 	far.targets = map[string]string{
 		"mini.example.com": resolved("me", "mini.example.com", "22"),
-		"mini-lan":         resolved("me", "hung-mini.local", "22"),
-		"mini-local-dot":   resolved("me", "Hung-Mini.local.", "22"),
+		"mini-lan":         resolved("me", "dev-mini.local", "22"),
+		"mini-local-dot":   resolved("me", "Dev-Mini.local.", "22"),
 		"box-lan":          resolved("me", "box.local", "22"),
-		"devbox":           resolved("me", "hung-mini.example.org", "22"),
+		"devbox":           resolved("me", "dev-mini.example.org", "22"),
 	}
 	mini := host{Name: "mini", Destination: "mini.example.com", GateInbox: "gate-inbox", Tmux: "tmux"}
 	e := newManaged(t, far, mini)
 	// macOS can report its hostname with ".local" on the end too.
-	e.reg.learn("mini", "mini.example.com", about{Hostname: "Hung-Mini.local"})
+	e.reg.learn("mini", "mini.example.com", about{Hostname: "Dev-Mini.local"})
 	found, _ := e.suggestions(context.Background())
 	var got []string
 	for _, s := range found {
@@ -1101,14 +1101,14 @@ func TestSuggestionsLeaveOutALocalNameForAMachineOnTheBoard(t *testing.T) {
 
 func TestShortHostname(t *testing.T) {
 	for in, want := range map[string]string{
-		"hung-mini": "hung-mini", "Hung-Mini.local": "hung-mini", "hung-mini.local.": "hung-mini",
-		"hung-mini.example.com": "hung-mini.example.com", "192.168.1.5": "192.168.1.5", "": "",
+		"dev-mini": "dev-mini", "Dev-Mini.local": "dev-mini", "dev-mini.local.": "dev-mini",
+		"dev-mini.example.com": "dev-mini.example.com", "192.168.1.5": "192.168.1.5", "": "",
 	} {
 		if got := shortHostname(in); got != want {
 			t.Errorf("shortHostname(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if got := targetHost("me@hung-mini.local:22"); got != "hung-mini.local" {
+	if got := targetHost("me@dev-mini.local:22"); got != "dev-mini.local" {
 		t.Fatal(got)
 	}
 }
