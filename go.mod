@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/shirou/gopsutil/v4 v4.26.8
 	github.com/usestring/gate-inbox v1.1.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
@@ -53,7 +54,6 @@ require (
 	golang.org/x/mobile v0.0.0-20250606033058-a2a15c67f36f // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	howett.net/plist v1.0.1 // indirect

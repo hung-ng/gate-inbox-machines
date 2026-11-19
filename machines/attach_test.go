@@ -5,8 +5,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -109,6 +113,109 @@ func TestAttachLoopStopsWithItsContext(t *testing.T) {
 	err := attachLoop(ctx, &bytes.Buffer{}, run, "mini", "a1", sleepCtx, nil)
 	if err != context.Canceled {
 		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+func TestAttachLoopSkipsAttemptWhenAlreadyCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	run := func(context.Context) (int, error) {
+		t.Fatal("started SSH after cancellation")
+		return 0, nil
+	}
+	if err := attachLoop(ctx, &bytes.Buffer{}, run, "mini", "a1", sleepCtx, nil); err != context.Canceled {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+func TestAttachStopsWhenTmuxServerDies(t *testing.T) {
+	const testDirEnv = "GATE_INBOX_ATTACH_TEST_DIR"
+	if dir := os.Getenv(testDirEnv); dir != "" {
+		e := New()
+		e.cfg.ControlPath = "none"
+		e.reg = newRegistry(machineStore(t, dir, mini))
+		e.attach = func(ctx context.Context, _ []string) (int, error) {
+			// Exercise terminal hangup detection with no SIGHUP to the helper
+			// or its child. The child keeps running after the pane closes.
+			signal.Ignore(syscall.SIGHUP)
+			return execAttach(ctx, []string{"/bin/sh", "-c",
+				`printf '%s\n' "$$" > "$1"; exec sleep 30`, "ssh", filepath.Join(dir, "ssh.pid")})
+		}
+		if err := e.runAttach(t.Context(), []string{mini.Name, "ab12"}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "returned"), []byte("ok\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("no tmux on PATH")
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the socket path short enough for both macOS and Linux.
+	dir, err := os.MkdirTemp("/tmp", "gi-attach-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	run := func(args ...string) string {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, tmux, append([]string{"-f", "/dev/null", "-S", filepath.Join(dir, "s")}, args...)...)
+		cmd.Env = append(os.Environ(), testDirEnv+"="+dir, "GORACE=atexit_sleep_ms=0")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	t.Cleanup(func() { _ = exec.Command(tmux, "-S", filepath.Join(dir, "s"), "kill-server").Run() })
+	pid, err := strconv.Atoi(run("new-session", "-d", "-P", "-F", "#{pane_pid}",
+		bin, "-test.run=^TestAttachStopsWhenTmuxServerDies$"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	waitFor := func(name string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+			if data, err := os.ReadFile(path); err == nil {
+				if len(data) > 0 {
+					return strings.TrimSpace(string(data))
+				}
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", name)
+		return ""
+	}
+	sshPID, err := strconv.Atoi(waitFor("ssh.pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			_ = syscall.Kill(sshPID, syscall.SIGKILL)
+		}
+	})
+	run("kill-server")
+	waitFor("returned")
+	if err := syscall.Kill(sshPID, 0); err != syscall.ESRCH {
+		t.Fatalf("SSH process %d remained after attach returned: %v", sshPID, err)
 	}
 }
 

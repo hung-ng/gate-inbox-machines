@@ -306,6 +306,9 @@ func (e *Extension) runSessions(ctx context.Context, args []string, host extensi
 }
 
 func (e *Extension) runAttach(ctx context.Context, args []string, host extension.Host) error {
+	ctx, stop := attachContext(ctx)
+	defer stop()
+
 	// The board launches the tool with its prompt ahead of these arguments,
 	// and a mirror has none, so an empty word may lead them.
 	args = slices.DeleteFunc(slices.Clone(args), func(a string) bool { return a == "" })

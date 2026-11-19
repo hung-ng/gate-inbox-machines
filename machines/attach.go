@@ -7,12 +7,49 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // attachRunner runs one interactive ssh in the pane and returns its exit
 // code. Tests swap it for one that returns codes from a script.
 type attachRunner func(ctx context.Context, argv []string) (code int, err error)
+
+func attachContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(parent, syscall.SIGHUP)
+	fd := int(os.Stdin.Fd())
+	// A terminal that closed before this check can already return EIO.
+	if _, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ); err != nil && !errors.Is(err, unix.EIO) {
+		return ctx, stop
+	}
+
+	// A pane can close without delivering SIGHUP to this process. Poll
+	// for hangup without reading the input that belongs to SSH.
+	ctx, cancel := context.WithCancel(ctx)
+	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if _, err := unix.Poll(fds, 0); err == nil && fds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		stop()
+	}
+}
 
 func execAttach(ctx context.Context, argv []string) (int, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -38,8 +75,8 @@ const (
 )
 
 // attachLoop keeps a mirror's pane attached to its session until the pane
-// is closed. It never ends on its own: the board ends the pane, through
-// its reconcile loop, once the session is gone from its machine's list.
+// closes or the context is canceled. The board closes the pane when the
+// remote session disappears from its machine's list.
 //
 // That matters because a pane whose command exits is left on a login shell
 // on this machine. Triage would then hand the operator a row that looks
@@ -61,6 +98,9 @@ func attachLoop(ctx context.Context, out io.Writer, attempt func(context.Context
 	retry := firstRetry
 	lastCode := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		code, err := attempt(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
